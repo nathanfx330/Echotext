@@ -1,0 +1,52 @@
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.buildlog/
+.history
+.svn/
+migrate_working_dir/
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# The .vscode folder contains configureation for Visual Studio Code.
+# As it contains settings that are specific to the user, we ignore it.
+.vscode/
+
+# Flutter/Dart/Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+/flutter_export_environment.sh
+lib/generated_plugin_registrant.dart
+pubspec.lock
+
+# Web related
+lib/generated_plugin_registrant.dart
+
+# macOS
+.DS_Store
+
+# --- ECHOTEXT CUSTOM IGNORES ---
+# Ignore the model directory to protect your custom trained model
+/model/*
+!/model/.gitkeep
+
+# Ignore the Piper executable/source directories to prevent massive repo bloat
+/piper/*
+!/piper/.gitkeep
+
+/assets/piper/*
+!/assets/piper/.gitkeep
