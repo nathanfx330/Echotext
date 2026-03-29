@@ -6,8 +6,12 @@ EchoText runs completely offline, piping your text directly into the Piper engin
 
 ## Features
 * **100% Offline TTS:** Powered by local `.onnx` models. No cloud APIs or internet connection required.
+* **Dynamic Model Selection:** Load custom `.onnx` voice models on the fly using the built-in file picker.
+* **Audio Export:** Save your generated speech directly to `.wav` files.
+* **Advanced Playback Controls:** Adjust speech speed (length scale) and choose specific speakers for multi-speaker models. Cancel long generations instantly with the Stop button.
+* **Auto-Save:** Never lose your work. EchoText automatically saves your text and settings between sessions.
 * **Cross-Platform:** Supports both Linux and Windows.
-* **Automatic Bundling:** CMake configurations automatically bundle your local Piper executable and models into the final release build.
+* **Automatic Bundling:** CMake configurations automatically bundle your local Piper executable and default models into the final release build.
 * **Clean UI:** A distraction-free, modern dark theme built with Material 3.
 
 ## Setup & Installation
@@ -18,12 +22,12 @@ EchoText runs completely offline, piping your text directly into the Piper engin
 * A Piper `.onnx` voice model and its accompanying `.onnx.json` config file.
 
 ### 2. Project Structure
-To run EchoText locally, you need to place the Piper executable and your models in the root of the project:
+To run EchoText locally with a default voice, you need to place the Piper executable and your models in the root of the project:
 
 ```text
 echotext/
 ├── model/
-│   ├── piper.onnx       <-- Your downloaded/trained voice model
+│   ├── piper.onnx       <-- Default voice model (optional, can be changed in-app)
 │   └── piper.onnx.json  <-- The config for the model
 ├── piper/
 │   ├── piper            <-- The Piper executable (piper.exe on Windows)
@@ -57,4 +61,4 @@ flutter build windows
 ```
 
 ## License
-Distributed under the MIT License. See `LICENSE` for more information.
+Distributed under the MIT License. 
