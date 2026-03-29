@@ -50,3 +50,11 @@ lib/generated_plugin_registrant.dart
 
 /assets/piper/*
 !/assets/piper/.gitkeep
+
+# Ignore ONNX models and JSON configs anywhere in the project just in case
+*.onnx
+*.onnx.json
+
+# Ignore generated audio files from testing
+*.wav
+*.mp3
