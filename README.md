@@ -5,6 +5,7 @@ A clean, dark-themed Flutter desktop application for on-the-fly Text-to-Speech (
 EchoText runs completely offline, piping your text directly into the Piper engine and playing the generated audio instantly.
 
 ## ✨ New in this Version
+* **Perfectly Timed Subtitles (.SRT Export):** You can now generate `.srt` subtitle files alongside your `.wav` exports. EchoText mathematically calculates exact audio durations from the raw WAV headers sentence-by-sentence to ensure your subtitles remain perfectly synced to the generated speech—zero drifting, zero external tools needed!
 * **Bouncing Ball Highlighting:** Text is highlighted sentence-by-sentence as it is spoken, ensuring you never lose your place.
 * **Interactive Playback:** 
   * Click on any sentence while audio is playing to instantly jump to that part of the text.
@@ -16,7 +17,7 @@ EchoText runs completely offline, piping your text directly into the Piper engin
 ## Features
 * **100% Offline TTS:** Powered by local `.onnx` models. No cloud APIs or internet connection required.
 * **Dynamic Model Selection:** Switch models on the fly via the dropdown, or load custom `.onnx` voice models using the built-in file picker.
-* **Audio Export:** Save your generated speech directly to `.wav` files.
+* **Audio & Subtitle Export:** Save your generated speech directly to `.wav` files, with optional perfectly-timed `.srt` files.
 * **Advanced Playback Controls:** Adjust speech speed (length scale) and choose specific speakers for multi-speaker models.
 * **Auto-Save:** Never lose your work. EchoText automatically saves your text and settings between sessions.
 * **Cross-Platform:** Supports both Linux and Windows.
