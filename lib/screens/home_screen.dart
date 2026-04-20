@@ -251,6 +251,37 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
       });
     }
 
+    // Ask user if they want perfectly timed subtitles generated
+    bool? generateSubtitles = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF1E1E1E),
+          title: const Text('Generate Subtitles?'),
+          content: const Text(
+            'Do you want to generate a perfectly timed .srt subtitle file alongside your audio?\n\n'
+            'Note: This takes slightly longer as the audio is generated and mathematically stitched sentence-by-sentence.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('No, Just Audio', style: TextStyle(color: Colors.white70)),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.blueGrey.shade700,
+                foregroundColor: Colors.white,
+              ),
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Yes, Audio + .SRT'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (generateSubtitles == null) return; // User closed dialog
+
     String? outputFile = await FilePicker.platform.saveFile(
       dialogTitle: 'Save Audio As...',
       fileName: 'echotext_audio.wav',
@@ -270,16 +301,22 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
       final outFile = File(outputFile);
       if (await outFile.exists()) await outFile.delete();
 
+      List<String>? chunksForSubtitles = generateSubtitles ? _splitIntoSentences(text) : null;
+
       bool success = await _piperService.generateToFile(
         text,
         outputFile,
         modelPath: _modelPath,
         speed: _speechSpeed,
         speakerId: _speakerId,
+        chunksForSubtitles: chunksForSubtitles,
       );
 
       if (success && mounted && await outFile.exists()) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Audio successfully saved to:\n$outputFile')));
+        String msg = generateSubtitles 
+            ? 'Audio and Subtitles (.srt) successfully saved to:\n${outFile.parent.path}'
+            : 'Audio successfully saved to:\n$outputFile';
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
       } else {
         throw Exception('Failed to write file or process exited with error.');
       }
