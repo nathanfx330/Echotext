@@ -223,7 +223,6 @@ class PiperService {
     final timestamp = DateTime.now().millisecondsSinceEpoch;
     
     int srtIndex = 1;
-    int currentOffsetMs = 0;
     StringBuffer srtContent = StringBuffer();
     
     // We stream the raw audio bytes here temporarily so we don't hold it all in memory
@@ -273,22 +272,21 @@ class PiperService {
          int actualDataSize = bytes.length - 44;
          int readSize = (dataSize < actualDataSize && dataSize > 0) ? dataSize : actualDataSize;
 
+         int startBytes = totalDataBytes; // Track absolute bytes before adding this chunk
+
          Uint8List audioData = bytes.sublist(44, 44 + readSize);
          rawSink.add(audioData);
          totalDataBytes += audioData.length;
          
-         // Math: Duration = (Total Bytes * 1000) / Bytes Per Second
-         int durationMs = (audioData.length * 1000) ~/ byteRate;
-         
-         int startMs = currentOffsetMs;
-         int endMs = currentOffsetMs + durationMs;
+         // Math Fix: Calculate absolute timestamps based on total bytes to eliminate accumulating rounding errors
+         int startMs = (startBytes * 1000) ~/ byteRate;
+         int endMs = (totalDataBytes * 1000) ~/ byteRate;
          
          srtContent.writeln(srtIndex++);
          srtContent.writeln('${_formatSrtTime(startMs)} --> ${_formatSrtTime(endMs)}');
          srtContent.writeln(textChunk.trim());
          srtContent.writeln(); // Blank line between subtitles
          
-         currentOffsetMs = endMs;
          await chunkFile.delete(); // Cleanup to save space
       }
     }
