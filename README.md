@@ -5,21 +5,29 @@ A clean, dark-themed Flutter desktop application for on-the-fly Text-to-Speech (
 EchoText runs completely offline, piping your text directly into the Piper engine and playing the generated audio instantly.
 
 ## ✨ New in this Version
-* **Perfectly Timed Subtitles (.SRT Export):** You can now generate `.srt` subtitle files alongside your `.wav` exports. EchoText mathematically calculates exact audio durations from the raw WAV headers sentence-by-sentence to ensure your subtitles remain perfectly synced to the generated speech—zero drifting, zero external tools needed!
-* **Bouncing Ball Highlighting:** Text is highlighted sentence-by-sentence as it is spoken, ensuring you never lose your place.
-* **Interactive Playback:** 
-  * Click on any sentence while audio is playing to instantly jump to that part of the text.
-  * Put your text cursor anywhere in the editor and hit "Read Text" to start reading exactly from that spot.
-  * Hit "Stop", and your text cursor will automatically snap to the exact sentence you stopped at so you can resume editing seamlessly.
-* **AI Formatting Cleaner:** A built-in "Magic Wand" tool instantly strips out LLM/Markdown artifacts (like `**bold**`, `### headers`, and `_italics_`) so Piper reads natural text, not punctuation. Includes a standard Find & Replace.
-* **Folder-Based Voice Management:** Drop multiple Piper voices into sub-folders inside the `model` directory, and EchoText will automatically scan and populate them in a dropdown menu.
+* **Highly Accurate Subtitles (.SRT Export):** You can now generate `.srt` subtitle files alongside your `.wav` exports. EchoText mathematically calculates audio durations from the raw WAV headers and uses a custom **16-bit PCM Voice Activity Detector (VAD)** to strip trailing neural silence. This drastically reduces subtitle drift during massive (4-hour+) audio exports!
+* **Native Desktop Editing Experience:**
+  * **Right-Click to Read:** Right-click anywhere in the editor and select "🔊 Read from here" from the native context menu.
+  * **Double-Click Start:** Double-click anywhere on the text to instantly start playing from that sentence.
+  * **Interactive Playback:** Single-click on any highlighted sentence while audio is playing to instantly jump to that part of the text.
+  * **Zero Layout Shifts:** A custom text highlighting controller ensures the scrollbar stays native and the UI never violently jumps when playback starts.
+* **Advanced Magic Format Cleaner:** 
+  * **PDF Line Fixer:** Automatically re-joins broken sentences copied from PDFs, with a custom minimum-character slider and "Smart-join" logic for transcript labels (e.g., "Q", "A", "Speaker:").
+  * **AI Artifact Cleaner:** Instantly strips out Markdown artifacts (like `**bold**` and `### headers`).
+  * **Unicode Stripper:** Safely removes emojis and non-standard symbols that commonly crash TTS engines.
+* **Long-Form Generation Safety:** 
+  * Massive audiobook exports now feature a real-time **ETA and Progress Bar**.
+  * **Error Logging:** If a weird sentence crashes the Piper engine during a 4-hour export, the app catches it, skips it, finishes the audio, and generates an `echotext_audio_errors.log` file so you know exactly what was dropped.
+* **Ctrl+F Search:** A native search bar that highlights matches in the text and auto-scrolls to them.
+* **Undo Stack:** A 20-step undo memory protects you from accidental text clearing or massive Find & Replace mistakes.
 
 ## Features
 * **100% Offline TTS:** Powered by local `.onnx` models. No cloud APIs or internet connection required.
 * **Dynamic Model Selection:** Switch models on the fly via the dropdown, or load custom `.onnx` voice models using the built-in file picker.
-* **Audio & Subtitle Export:** Save your generated speech directly to `.wav` files, with optional perfectly-timed `.srt` files.
+* **Audio & Subtitle Export:** Save your generated speech directly to `.wav` files, with optional highly-accurate `.srt` files.
 * **Advanced Playback Controls:** Adjust speech speed (length scale) and choose specific speakers for multi-speaker models.
 * **Auto-Save:** Never lose your work. EchoText automatically saves your text and settings between sessions.
+* **Folder-Based Voice Management:** Drop multiple Piper voices into sub-folders inside the `model` directory, and EchoText will automatically scan and populate them.
 * **Cross-Platform:** Supports both Linux and Windows.
 * **Clean Architecture:** Separated into distinct UI, Service, and Model layers for easy maintenance.
 
