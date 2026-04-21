@@ -155,26 +155,34 @@ class PiperService {
     final outFile = p.join(dir, 'chunk_${index}_$playbackId.wav');
     final f = File(outFile);
 
-    List<String> args = [
-      '--model', modelPath,
-      '--output_file', outFile,
-      '--length_scale', speed.toStringAsFixed(2),
-    ];
-    if (speakerId > 0) args.addAll(['--speaker', speakerId.toString()]);
+    try {
+      List<String> args = [
+        '--model', modelPath,
+        '--output_file', outFile,
+        '--length_scale', speed.toStringAsFixed(2),
+      ];
+      if (speakerId > 0) args.addAll(['--speaker', speakerId.toString()]);
 
-    Process process = await Process.start(exePath, args);
-    _activeProcesses.add(process);
-    
-    process.stdin.write(text);
-    await process.stdin.close();
-    
-    final exitCode = await process.exitCode;
-    _activeProcesses.remove(process);
+      Process process = await Process.start(exePath, args);
+      _activeProcesses.add(process);
+      
+      // Prevent OS pipe deadlock by silently draining the logs
+      process.stdout.drain();
+      process.stderr.drain();
+      
+      process.stdin.write(text);
+      await process.stdin.close();
+      
+      final exitCode = await process.exitCode;
+      _activeProcesses.remove(process);
 
-    if (playbackId != _currentPlaybackId) return null;
+      if (playbackId != _currentPlaybackId) return null;
 
-    if (exitCode == 0 && await f.exists() && await f.length() > 100) {
-      return outFile;
+      if (exitCode == 0 && await f.exists() && await f.length() > 100) {
+        return outFile;
+      }
+    } catch (e) {
+      print("Error generating playback chunk $index: $e");
     }
     return null;
   }
@@ -189,56 +197,78 @@ class PiperService {
     return '${hours.toString().padLeft(2, '0')}:${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')},${milliseconds.toString().padLeft(3, '0')}';
   }
 
+  // Helper function to format ETA
+  String _formatETA(int totalMilliseconds) {
+    if (totalMilliseconds < 0) return "00:00";
+    int totalSeconds = totalMilliseconds ~/ 1000;
+    int hours = totalSeconds ~/ 3600;
+    int minutes = (totalSeconds % 3600) ~/ 60;
+    int seconds = totalSeconds % 60;
+    
+    if (hours > 0) {
+      return '${hours.toString().padLeft(2, '0')}:${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
+    }
+    return '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
+  }
+
   Future<bool> generateToFile(
     String text,
     String outputPath, {
     required String modelPath,
     required double speed,
     required int speakerId,
-    List<String>? chunksForSubtitles, // If provided, generates a matching .srt file
+    List<String>? exportChunks, // We will chunk no matter what for ETA/Memory safety
+    bool isSubtitlesRequested = false, // Flag to decide if we write the SRT file
+    void Function(int current, int total, String eta)? onProgress, // ETA Callback
   }) async {
-    // Standard fast generation if no subtitles are requested
-    if (chunksForSubtitles == null || chunksForSubtitles.isEmpty) {
-      List<String> args = [
-        '--model', modelPath,
-        '--output_file', outputPath,
-        '--length_scale', speed.toStringAsFixed(2),
-      ];
-      if (speakerId > 0) args.addAll(['--speaker', speakerId.toString()]);
+    // Fallback to monolithic fast generation only if no chunks were somehow provided
+    if (exportChunks == null || exportChunks.isEmpty) {
+      try {
+        List<String> args = [
+          '--model', modelPath,
+          '--output_file', outputPath,
+          '--length_scale', speed.toStringAsFixed(2),
+        ];
+        if (speakerId > 0) args.addAll(['--speaker', speakerId.toString()]);
 
-      Process process = await Process.start(exePath, args);
-      _activeProcesses.add(process);
-      
-      process.stdin.write(text);
-      await process.stdin.close();
+        Process process = await Process.start(exePath, args);
+        _activeProcesses.add(process);
+        
+        process.stdout.drain();
+        process.stderr.drain();
+        
+        process.stdin.write(text);
+        await process.stdin.close();
 
-      final exitCode = await process.exitCode;
-      _activeProcesses.remove(process);
-      
-      return exitCode == 0;
+        final exitCode = await process.exitCode;
+        _activeProcesses.remove(process);
+        
+        return exitCode == 0;
+      } catch (e) {
+        print("Error generating fast file: $e");
+        return false;
+      }
     }
 
-    // --- CHUNK & STITCH GENERATION (For perfect Subtitle Timings) ---
+    // --- CHUNK & STITCH GENERATION (For ETA, Memory Safety, and Subtitles) ---
     final tempDir = await getTemporaryDirectory();
     final timestamp = DateTime.now().millisecondsSinceEpoch;
     
     int srtIndex = 1;
     StringBuffer srtContent = StringBuffer();
+    StringBuffer errorLog = StringBuffer(); // Master buffer to catch all generation failures
     
-    // We stream the raw audio bytes here temporarily so we don't hold it all in memory
     File rawAudioTempFile = File(p.join(tempDir.path, 'temp_raw_audio_$timestamp.tmp'));
     var rawSink = rawAudioTempFile.openWrite();
     
     int totalDataBytes = 0;
     
-    // Extracted directly from the chunks so the master header is perfectly accurate
     int? sampleRate;
     int? numChannels;
     int? bitsPerSample;
     int? byteRate;
     int? blockAlign;
 
-    // Helper to safely find exact chunk locations in the WAV file
     int findChunk(Uint8List b, String chunkId) {
       if (b.length < 12) return -1;
       int offset = 12;
@@ -251,113 +281,154 @@ class PiperService {
       return -1;
     }
     
-    for (int i = 0; i < chunksForSubtitles.length; i++) {
-      String textChunk = chunksForSubtitles[i];
-      // Skip empty or non-spoken chunks
+    DateTime startTime = DateTime.now();
+    
+    for (int i = 0; i < exportChunks.length; i++) {
+      String textChunk = exportChunks[i];
       if (!textChunk.contains(RegExp(r'[a-zA-Z0-9\p{L}]', unicode: true))) continue;
 
       String tempWavPath = p.join(tempDir.path, 'export_chunk_${timestamp}_$i.wav');
       File chunkFile = File(tempWavPath);
 
-      List<String> args = [
-        '--model', modelPath,
-        '--output_file', tempWavPath,
-        '--length_scale', speed.toStringAsFixed(2),
-      ];
-      if (speakerId > 0) args.addAll(['--speaker', speakerId.toString()]);
+      try {
+        List<String> args = [
+          '--model', modelPath,
+          '--output_file', tempWavPath,
+          '--length_scale', speed.toStringAsFixed(2),
+        ];
+        if (speakerId > 0) args.addAll(['--speaker', speakerId.toString()]);
 
-      Process process = await Process.start(exePath, args);
-      _activeProcesses.add(process);
-      process.stdin.write(textChunk);
-      await process.stdin.close();
-      await process.exitCode;
-      _activeProcesses.remove(process);
+        Process process = await Process.start(exePath, args);
+        _activeProcesses.add(process);
+        
+        process.stdout.drain();
+        process.stderr.drain();
+        
+        process.stdin.write(textChunk);
+        await process.stdin.close();
+        final exitCode = await process.exitCode;
+        _activeProcesses.remove(process);
 
-      if (await chunkFile.exists() && await chunkFile.length() > 44) {
-         var bytes = await chunkFile.readAsBytes();
-         
-         // Dynamically find where the formats and data actually start
-         int fmtOffset = findChunk(bytes, 'fmt ');
-         int dataOffset = findChunk(bytes, 'data');
-         
-         if (fmtOffset != -1 && dataOffset != -1) {
-           ByteData view = ByteData.view(bytes.buffer);
+        // Track Piper binary failures gracefully
+        if (exitCode != 0) {
+           errorLog.writeln('CHUNK $i FAILED: Piper exited with code $exitCode');
+           errorLog.writeln('TEXT: $textChunk\n');
+           continue; 
+        }
+
+        if (await chunkFile.exists() && await chunkFile.length() >= 44) {
+           var bytes = await chunkFile.readAsBytes();
            
-           if (sampleRate == null) {
-             numChannels = view.getUint16(fmtOffset + 10, Endian.little);
-             sampleRate = view.getUint32(fmtOffset + 12, Endian.little);
-             byteRate = view.getUint32(fmtOffset + 16, Endian.little);
-             blockAlign = view.getUint16(fmtOffset + 32, Endian.little);
-             bitsPerSample = view.getUint16(fmtOffset + 34, Endian.little);
-           }
+           int fmtOffset = findChunk(bytes, 'fmt ');
+           int dataOffset = findChunk(bytes, 'data');
            
-           int dataSize = view.getUint32(dataOffset + 4, Endian.little);
-           int actualAvailable = bytes.length - (dataOffset + 8);
-           int readSize = (dataSize < actualAvailable && dataSize > 0) ? dataSize : actualAvailable;
-           
-           // Ensure we read complete audio frames to prevent static phase shifting
-           readSize = readSize - (readSize % blockAlign!);
-           
-           if (readSize > 0) {
-             // Extract pure audio data, leaving all metadata behind
-             Uint8List audioData = bytes.sublist(dataOffset + 8, dataOffset + 8 + readSize);
+           if (fmtOffset != -1 && dataOffset != -1) {
+             ByteData view = ByteData.view(bytes.buffer);
              
-             // --- VAD: PCM SILENCE STRIPPER ---
-             if (bitsPerSample == 16) {
-               ByteData chunkView = ByteData.view(audioData.buffer, audioData.offsetInBytes, audioData.length);
-               int threshold = 150; // Amplitude threshold to detect "silence" (0-32767)
-               
-               // Find exact byte where speaking starts
-               int firstAudible = 0;
-               for (int j = 0; j <= audioData.length - blockAlign!; j += blockAlign!) {
-                 if (chunkView.getInt16(j, Endian.little).abs() > threshold) {
-                   firstAudible = j; break;
-                 }
-               }
-               
-               // Find exact byte where speaking stops
-               int lastAudible = audioData.length - blockAlign!;
-               for (int j = audioData.length - blockAlign!; j >= firstAudible; j -= blockAlign!) {
-                 if (chunkView.getInt16(j, Endian.little).abs() > threshold) {
-                   lastAudible = j; break;
-                 }
-               }
-               
-               // Add a tiny 50ms padding so we don't clip natural breaths/consonants
-               int padBytes = (byteRate! * 0.05).toInt();
-               padBytes = padBytes - (padBytes % blockAlign!); 
-               
-               firstAudible = (firstAudible - padBytes).clamp(0, audioData.length);
-               lastAudible = (lastAudible + padBytes).clamp(0, audioData.length - blockAlign!);
-               
-               // Truncate the audio data to the exact spoken duration
-               if (lastAudible >= firstAudible) {
-                 audioData = audioData.sublist(firstAudible, lastAudible + blockAlign!);
-               }
+             if (sampleRate == null) {
+               numChannels = view.getUint16(fmtOffset + 10, Endian.little);
+               sampleRate = view.getUint32(fmtOffset + 12, Endian.little);
+               byteRate = view.getUint32(fmtOffset + 16, Endian.little);
+               blockAlign = view.getUint16(fmtOffset + 32, Endian.little);
+               bitsPerSample = view.getUint16(fmtOffset + 34, Endian.little);
              }
-             // --- END VAD ---
+             
+             int dataSize = view.getUint32(dataOffset + 4, Endian.little);
+             int actualAvailable = bytes.length - (dataOffset + 8);
+             int readSize = (dataSize < actualAvailable && dataSize > 0) ? dataSize : actualAvailable;
+             
+             readSize = readSize - (readSize % blockAlign!);
+             
+             if (readSize > 0) {
+               Uint8List audioData = bytes.sublist(dataOffset + 8, dataOffset + 8 + readSize);
+               
+               // --- VAD: PCM SILENCE STRIPPER ---
+               if (bitsPerSample == 16 && audioData.length >= blockAlign!) {
+                 ByteData chunkView = ByteData.view(audioData.buffer, audioData.offsetInBytes, audioData.length);
+                 int threshold = 150;
+                 
+                 int firstAudible = 0;
+                 for (int j = 0; j <= audioData.length - blockAlign!; j += blockAlign!) {
+                   if (chunkView.getInt16(j, Endian.little).abs() > threshold) {
+                     firstAudible = j; break;
+                   }
+                 }
+                 
+                 int lastAudible = audioData.length - blockAlign!;
+                 if (lastAudible < 0) lastAudible = 0;
+                 for (int j = audioData.length - blockAlign!; j >= firstAudible; j -= blockAlign!) {
+                   if (chunkView.getInt16(j, Endian.little).abs() > threshold) {
+                     lastAudible = j; break;
+                   }
+                 }
+                 
+                 int padBytes = (byteRate! * 0.05).toInt();
+                 padBytes = padBytes - (padBytes % blockAlign!); 
+                 
+                 firstAudible = (firstAudible - padBytes).clamp(0, audioData.length);
+                 lastAudible = (lastAudible + padBytes).clamp(0, audioData.length - blockAlign!);
+                 
+                 if (lastAudible >= firstAudible) {
+                   audioData = audioData.sublist(firstAudible, lastAudible + blockAlign!);
+                 } else {
+                   audioData = Uint8List(0); // Flag as empty if VAD stripped everything
+                 }
+               }
 
-             int startBytes = totalDataBytes; 
-             rawSink.add(audioData);
-             totalDataBytes += audioData.length;
-             
-             int startMs = (startBytes * 1000) ~/ byteRate!;
-             int endMs = (totalDataBytes * 1000) ~/ byteRate!;
-             
-             // Enforce a 15ms gap to stop Premiere/VLC from cascading overlap drift
-             int displayEndMs = endMs - 15; 
-             if (displayEndMs <= startMs) displayEndMs = startMs + 10;
-             
-             // Strip all newlines so the SRT parser block format doesn't break
-             String safeText = textChunk.trim().replaceAll(RegExp(r'\s+'), ' ');
-             
-             srtContent.writeln(srtIndex++);
-             srtContent.writeln('${_formatSrtTime(startMs)} --> ${_formatSrtTime(displayEndMs)}');
-             srtContent.writeln(safeText);
-             srtContent.writeln(); 
+               // Ensure the chunk ACTUALLY has data before appending
+               if (audioData.isNotEmpty) {
+                 int startBytes = totalDataBytes; 
+                 rawSink.add(audioData);
+                 totalDataBytes += audioData.length;
+                 
+                 int startMs = (startBytes * 1000) ~/ byteRate!;
+                 int endMs = (totalDataBytes * 1000) ~/ byteRate!;
+                 
+                 int displayEndMs = endMs - 15; 
+                 if (displayEndMs <= startMs) displayEndMs = startMs + 10;
+                 
+                 String safeText = textChunk.trim().replaceAll(RegExp(r'\s+'), ' ');
+                 
+                 srtContent.writeln(srtIndex++);
+                 srtContent.writeln('${_formatSrtTime(startMs)} --> ${_formatSrtTime(displayEndMs)}');
+                 srtContent.writeln(safeText);
+                 srtContent.writeln(); 
+               } else {
+                 errorLog.writeln('CHUNK $i FAILED: VAD removed all audio (completely silent chunk).');
+                 errorLog.writeln('TEXT: $textChunk\n');
+               }
+             } else {
+               errorLog.writeln('CHUNK $i FAILED: WAV header was valid but contained 0 bytes of audio data.');
+               errorLog.writeln('TEXT: $textChunk\n');
+             }
+           } else {
+             errorLog.writeln('CHUNK $i FAILED: Could not find valid fmt/data chunks in generated WAV.');
+             errorLog.writeln('TEXT: $textChunk\n');
            }
-         }
-         await chunkFile.delete(); // Cleanup to save space
+           await chunkFile.delete(); 
+        } else {
+           errorLog.writeln('CHUNK $i FAILED: Generated file was 0 bytes, missing, or corrupted.');
+           errorLog.writeln('TEXT: $textChunk\n');
+        }
+      } catch (e) {
+        errorLog.writeln('CHUNK $i FAILED: VAD or System Exception - $e');
+        errorLog.writeln('TEXT: $textChunk\n');
+        try {
+          if (await chunkFile.exists()) await chunkFile.delete();
+        } catch (_) {}
+      }
+
+      // --- ETA & Progress Update ---
+      if (onProgress != null) {
+        int currentCount = i + 1;
+        int totalCount = exportChunks.length;
+        int elapsedMs = DateTime.now().difference(startTime).inMilliseconds;
+        
+        // Calculate average time per chunk so far, multiply by remaining chunks
+        double msPerChunk = elapsedMs / currentCount;
+        int remainingMs = (msPerChunk * (totalCount - currentCount)).toInt();
+        
+        onProgress(currentCount, totalCount, _formatETA(remainingMs));
       }
     }
     
@@ -368,7 +439,6 @@ class PiperService {
        File finalWavFile = File(outputPath);
        var finalSink = finalWavFile.openWrite();
        
-       // Build a pristine, mathematically perfect canonical header from scratch
        var header = ByteData(44);
        header.setUint8(0, 0x52); header.setUint8(1, 0x49); header.setUint8(2, 0x46); header.setUint8(3, 0x46); // RIFF
        header.setUint32(4, totalDataBytes + 36, Endian.little);
@@ -386,15 +456,29 @@ class PiperService {
        
        finalSink.add(header.buffer.asUint8List());
        
-       // Stream in the raw audio data
        await finalSink.addStream(rawAudioTempFile.openRead());
        await finalSink.flush();
        await finalSink.close();
        
-       // Write the SRT text file side-by-side with the WAV file
-       String srtPath = outputPath.replaceAll(RegExp(r'\.wav$', caseSensitive: false), '.srt');
-       if (srtPath == outputPath) srtPath += '.srt'; // Fallback if extension was missing
-       await File(srtPath).writeAsString(srtContent.toString());
+       // Write the SRT file if requested
+       if (isSubtitlesRequested) {
+         String srtPath = outputPath.replaceAll(RegExp(r'\.wav$', caseSensitive: false), '.srt');
+         if (srtPath == outputPath) srtPath += '.srt'; 
+         await File(srtPath).writeAsString(srtContent.toString());
+       }
+       
+       // ALWAYS write the Error Log if ANY chunk failed
+       if (errorLog.isNotEmpty) {
+         String logPath = outputPath.replaceAll(RegExp(r'\.wav$', caseSensitive: false), '_errors.log');
+         if (logPath == outputPath) logPath += '_errors.log';
+         
+         String finalLogOutput = "ECHO TEXT GENERATION ERRORS\n";
+         finalLogOutput += "===========================\n";
+         finalLogOutput += "The following chunks failed to generate and were skipped to protect the master file.\n\n";
+         finalLogOutput += errorLog.toString();
+         
+         await File(logPath).writeAsString(finalLogOutput);
+       }
     }
     
     if (await rawAudioTempFile.exists()) {

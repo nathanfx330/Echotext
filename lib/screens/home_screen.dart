@@ -1,5 +1,7 @@
 import 'dart:io';
+import 'dart:async'; 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter/gestures.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
@@ -9,6 +11,103 @@ import 'package:file_picker/file_picker.dart';
 import '../models/voice_model.dart';
 import '../services/piper_service.dart';
 
+// Intent to handle Ctrl+F Search
+class SearchIntent extends Intent { const SearchIntent(); }
+
+// --- CUSTOM HIGHLIGHTING CONTROLLER ---
+class HighlightingTextEditingController extends TextEditingController {
+  int _highlightedChunkIndex = -1;
+  List<String> _chunks = [];
+  
+  String _searchQuery = "";
+  int _activeSearchMatchIndex = -1;
+
+  int get highlightedChunkIndex => _highlightedChunkIndex;
+  set highlightedChunkIndex(int value) {
+    if (_highlightedChunkIndex != value) {
+      _highlightedChunkIndex = value;
+      notifyListeners();
+    }
+  }
+
+  List<String> get chunks => _chunks;
+  set chunks(List<String> value) {
+    _chunks = value;
+    notifyListeners();
+  }
+
+  String get searchQuery => _searchQuery;
+  set searchQuery(String value) {
+    if (_searchQuery != value) {
+      _searchQuery = value;
+      notifyListeners();
+    }
+  }
+
+  int get activeSearchMatchIndex => _activeSearchMatchIndex;
+  set activeSearchMatchIndex(int value) {
+    if (_activeSearchMatchIndex != value) {
+      _activeSearchMatchIndex = value;
+      notifyListeners();
+    }
+  }
+
+  @override
+  TextSpan buildTextSpan({required BuildContext context, TextStyle? style, required bool withComposing}) {
+    // 1. Playback Chunk Highlighting
+    if (_highlightedChunkIndex >= 0 && _highlightedChunkIndex < _chunks.length && _chunks.isNotEmpty) {
+      List<TextSpan> spans = [];
+      int currentIndex = 0;
+      for (int i = 0; i < _chunks.length; i++) {
+        final chunk = _chunks[i];
+        if (currentIndex >= text.length) break;
+        spans.add(TextSpan(
+          text: chunk,
+          style: i == _highlightedChunkIndex
+              ? style?.copyWith(backgroundColor: Colors.blueGrey, color: Colors.white)
+              : style,
+        ));
+        currentIndex += chunk.length;
+      }
+      return TextSpan(style: style, children: spans);
+    }
+
+    // 2. Ctrl+F Search Highlighting
+    if (_searchQuery.isNotEmpty && _searchQuery.length >= 3) {
+      List<TextSpan> spans = [];
+      int start = 0;
+      String lowerText = text.toLowerCase();
+      String lowerQuery = _searchQuery.toLowerCase();
+      int queryLen = lowerQuery.length;
+
+      int index = lowerText.indexOf(lowerQuery, start);
+      while (index >= 0) {
+        if (index > start) {
+          spans.add(TextSpan(text: text.substring(start, index), style: style));
+        }
+        bool isActive = index == _activeSearchMatchIndex;
+        spans.add(TextSpan(
+          text: text.substring(index, index + queryLen),
+          style: style?.copyWith(
+            backgroundColor: isActive ? Colors.orangeAccent : Colors.blueGrey.withOpacity(0.6),
+            color: isActive ? Colors.black : Colors.white,
+          ),
+        ));
+        start = index + queryLen;
+        index = lowerText.indexOf(lowerQuery, start);
+      }
+      if (start < text.length) {
+        spans.add(TextSpan(text: text.substring(start), style: style));
+      }
+      return TextSpan(style: style, children: spans);
+    }
+
+    // Default
+    return TextSpan(style: style, text: text);
+  }
+}
+// --------------------------------------
+
 class EchoTextScreen extends StatefulWidget {
   const EchoTextScreen({super.key});
 
@@ -17,26 +116,45 @@ class EchoTextScreen extends StatefulWidget {
 }
 
 class _EchoTextScreenState extends State<EchoTextScreen> {
-  final TextEditingController _textController = TextEditingController();
+  final HighlightingTextEditingController _textController = HighlightingTextEditingController();
   final ScrollController _scrollController = ScrollController();
   final FocusNode _textFocusNode = FocusNode();
   
+  // Search Bar State
+  bool _isSearching = false;
+  String _searchQuery = "";
+  int _currentSearchMatch = -1;
+  List<int> _searchMatchIndices = [];
+  final TextEditingController _searchController = TextEditingController();
+  final FocusNode _searchFocusNode = FocusNode();
+  Timer? _searchDebounceTimer; 
+
   late SharedPreferences _prefs;
   final PiperService _piperService = PiperService();
 
   bool _isGenerating = false;
   bool _isPlaying = false;
   
-  // Bouncing Ball State
+  // Save Progress State
+  bool _isSaving = false;
+  double _saveProgress = 0.0;
+  String _saveEta = "";
+  
+  // Undo & Text State
+  final List<String> _undoStack = [];
+  String _lastSavedText = "";
+
+  // Playback State
   List<String> _textChunks = [];
   int _currentChunkIndex = -1;
   int _playbackId = 0; 
-  List<TapGestureRecognizer> _recognizers = []; 
   
   String _modelPath = '';
   VoiceModel? _selectedVoice;
   double _speechSpeed = 1.0;
   int _speakerId = 0;
+
+  int _lastEditorTapTime = 0;
 
   @override
   void initState() {
@@ -49,12 +167,18 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
     await _piperService.init();
 
     _textController.text = _prefs.getString('saved_text') ?? '';
+    _lastSavedText = _textController.text;
     _speechSpeed = _prefs.getDouble('speech_speed') ?? 1.0;
     _speakerId = _prefs.getInt('speaker_id') ?? 0;
 
     _textController.addListener(() {
-      _prefs.setString('saved_text', _textController.text);
-      setState(() {}); 
+      // Fix: Only run heavy logic if the physical text changes (ignores cursor selection changes)
+      if (_textController.text != _lastSavedText) {
+        _lastSavedText = _textController.text;
+        _prefs.setString('saved_text', _textController.text);
+        if (_isSearching) _updateSearch(_searchController.text); 
+        setState(() {}); 
+      }
     });
 
     final savedModel = _prefs.getString('custom_model_path');
@@ -77,34 +201,118 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
 
   @override
   void dispose() {
-    for (var r in _recognizers) {
-      r.dispose();
-    }
+    _searchDebounceTimer?.cancel();
     _textController.dispose();
     _scrollController.dispose();
     _textFocusNode.dispose();
+    _searchController.dispose();
+    _searchFocusNode.dispose();
     _piperService.dispose();
     super.dispose();
+  }
+
+  // --- SEARCH LOGIC ---
+  void _updateSearch(String query) {
+    if (_searchDebounceTimer?.isActive ?? false) _searchDebounceTimer!.cancel();
+    
+    _searchDebounceTimer = Timer(const Duration(milliseconds: 400), () {
+      _searchQuery = query;
+      _searchMatchIndices.clear();
+      
+      if (query.length < 3) {
+        _textController.searchQuery = "";
+        _textController.activeSearchMatchIndex = -1;
+        if (mounted) setState(() => _currentSearchMatch = -1);
+        return;
+      }
+
+      String lowerText = _textController.text.toLowerCase();
+      String lowerQuery = query.toLowerCase();
+      int start = 0;
+      int idx = lowerText.indexOf(lowerQuery, start);
+      
+      while(idx >= 0) {
+        _searchMatchIndices.add(idx);
+        start = idx + lowerQuery.length;
+        idx = lowerText.indexOf(lowerQuery, start);
+      }
+
+      if (_searchMatchIndices.isNotEmpty) {
+        _currentSearchMatch = 0;
+      } else {
+        _currentSearchMatch = -1;
+      }
+
+      _textController.searchQuery = query;
+      _scrollToSearchMatch();
+      if (mounted) setState(() {});
+    });
+  }
+
+  void _nextSearchMatch() {
+    if (_searchMatchIndices.isEmpty) return;
+    _currentSearchMatch = (_currentSearchMatch + 1) % _searchMatchIndices.length;
+    _scrollToSearchMatch();
+  }
+
+  void _prevSearchMatch() {
+    if (_searchMatchIndices.isEmpty) return;
+    _currentSearchMatch = (_currentSearchMatch - 1) % _searchMatchIndices.length;
+    if (_currentSearchMatch < 0) _currentSearchMatch += _searchMatchIndices.length;
+    _scrollToSearchMatch();
+  }
+
+  void _scrollToSearchMatch() {
+    if (_currentSearchMatch >= 0 && _currentSearchMatch < _searchMatchIndices.length) {
+      int offset = _searchMatchIndices[_currentSearchMatch];
+      _textController.activeSearchMatchIndex = offset;
+      
+      _textController.selection = TextSelection(baseOffset: offset, extentOffset: offset + _searchQuery.length);
+      
+      // Fix: The "Focus Bounce" Hack. Forces the TextField to auto-scroll off-screen matches.
+      bool wasFocused = _textFocusNode.hasFocus;
+      if (!wasFocused) {
+        _textFocusNode.requestFocus();
+      }
+      
+      setState(() {});
+
+      if (!wasFocused) {
+        Future.delayed(const Duration(milliseconds: 50), () {
+          if (mounted && _isSearching) {
+            _searchFocusNode.requestFocus();
+          }
+        });
+      }
+    }
+  }
+  // --------------------
+
+  // --- UNDO LOGIC ---
+  void _saveStateForUndo() {
+    final currentText = _textController.text;
+    if (_undoStack.isEmpty || _undoStack.last != currentText) {
+      _undoStack.add(currentText);
+      if (_undoStack.length > 20) {
+        _undoStack.removeAt(0); 
+      }
+      setState(() {});
+    }
+  }
+
+  void _handleUndo() {
+    if (_undoStack.isNotEmpty) {
+      setState(() {
+        _textController.text = _undoStack.removeLast();
+      });
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Action undone.')));
+    }
   }
 
   List<String> _splitIntoSentences(String text) {
     final RegExp sentenceRegex = RegExp(r'.*?[.!?\n]+|.+');
     final Iterable<Match> matches = sentenceRegex.allMatches(text);
     return matches.map((m) => m.group(0)!).toList();
-  }
-
-  void _updateRecognizers() {
-    for (var r in _recognizers) {
-      r.dispose();
-    }
-    _recognizers = List.generate(_textChunks.length, (index) {
-      return TapGestureRecognizer()
-        ..onTap = () {
-          if (_isPlaying && _currentChunkIndex != index) {
-            _startPlayback(index);
-          }
-        };
-    });
   }
 
   int _getChunkIndexFromCursor() {
@@ -131,75 +339,8 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
     }
   }
 
-  Future<void> _startPlayback(int startIndex) async {
-    final currentPlaybackId = ++_playbackId;
-
-    if (_isPlaying || _isGenerating) {
-      await _piperService.stop();
-    }
-
-    if (_textChunks.isEmpty) return;
-
-    setState(() {
-      _isGenerating = true;
-      _isPlaying = true;
-      _currentChunkIndex = startIndex;
-    });
-
-    try {
-      await _piperService.playChunks(
-        _textChunks,
-        modelPath: _modelPath,
-        speed: _speechSpeed,
-        speakerId: _speakerId,
-        startIndex: startIndex,
-        onChunkStart: (idx) {
-          if (mounted && _playbackId == currentPlaybackId) {
-            setState(() {
-              _currentChunkIndex = idx;
-              _isGenerating = false; 
-            });
-          }
-        },
-      );
-    } catch (e) {
-      debugPrint("TTS Error: $e");
-      if (mounted && _playbackId == currentPlaybackId) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error generating audio: $e')));
-      }
-    } finally {
-      if (mounted && _playbackId == currentPlaybackId) {
-        _syncCursorToCurrentChunk();
-        setState(() {
-          _isPlaying = false;
-          _isGenerating = false;
-          _currentChunkIndex = -1;
-        });
-      }
-    }
-  }
-
-  Future<void> _handlePlayStop() async {
+  Future<void> _startPlaybackFromCursor() async {
     if (!_piperService.isInitialized) return;
-
-    if (_isPlaying || _isGenerating) {
-      _playbackId++; 
-      
-      _syncCursorToCurrentChunk();
-      
-      await _piperService.stop();
-      
-      setState(() {
-        _isPlaying = false;
-        _isGenerating = false;
-        _currentChunkIndex = -1;
-      });
-      
-      Future.delayed(const Duration(milliseconds: 50), () {
-        if (mounted) _textFocusNode.requestFocus();
-      });
-      return;
-    }
 
     final text = _textController.text.trim();
     if (text.isEmpty) {
@@ -218,13 +359,88 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
     }
 
     _textChunks = _splitIntoSentences(_textController.text);
-    _updateRecognizers();
-
     int startIndex = _getChunkIndexFromCursor();
 
     FocusScope.of(context).unfocus();
-    
     _startPlayback(startIndex);
+  }
+
+  Future<void> _startPlayback(int startIndex) async {
+    final currentPlaybackId = ++_playbackId;
+
+    if (_isPlaying || _isGenerating) {
+      await _piperService.stop();
+    }
+
+    if (_textChunks.isEmpty) return;
+
+    setState(() {
+      _isGenerating = true;
+      _isPlaying = true;
+      _currentChunkIndex = startIndex;
+      _textController.chunks = _textChunks;
+      _textController.highlightedChunkIndex = startIndex;
+      _textController.searchQuery = ""; 
+    });
+
+    try {
+      await _piperService.playChunks(
+        _textChunks,
+        modelPath: _modelPath,
+        speed: _speechSpeed,
+        speakerId: _speakerId,
+        startIndex: startIndex,
+        onChunkStart: (idx) {
+          if (mounted && _playbackId == currentPlaybackId) {
+            setState(() {
+              _currentChunkIndex = idx;
+              _textController.highlightedChunkIndex = idx;
+              _isGenerating = false; 
+            });
+            _syncCursorToCurrentChunk();
+          }
+        },
+      );
+    } catch (e) {
+      debugPrint("TTS Error: $e");
+      if (mounted && _playbackId == currentPlaybackId) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error generating audio: $e')));
+      }
+    } finally {
+      if (mounted && _playbackId == currentPlaybackId) {
+        _syncCursorToCurrentChunk();
+        setState(() {
+          _isPlaying = false;
+          _isGenerating = false;
+          _currentChunkIndex = -1;
+          _textController.highlightedChunkIndex = -1;
+          if (_isSearching) _textController.searchQuery = _searchQuery; 
+        });
+      }
+    }
+  }
+
+  Future<void> _stopPlayback() async {
+    if (_isPlaying || _isGenerating) {
+      _playbackId++; 
+      
+      _syncCursorToCurrentChunk();
+      
+      await _piperService.stop();
+      
+      setState(() {
+        _isPlaying = false;
+        _isGenerating = false;
+        _isSaving = false;
+        _currentChunkIndex = -1;
+        _textController.highlightedChunkIndex = -1;
+        if (_isSearching) _textController.searchQuery = _searchQuery; 
+      });
+      
+      Future.delayed(const Duration(milliseconds: 50), () {
+        if (mounted) _textFocusNode.requestFocus();
+      });
+    }
   }
 
   Future<void> _handleSaveAudio() async {
@@ -242,16 +458,9 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
     }
 
     if (_isPlaying) {
-      _playbackId++;
-      _syncCursorToCurrentChunk();
-      await _piperService.stop();
-      setState(() {
-        _isPlaying = false;
-        _currentChunkIndex = -1;
-      });
+      await _stopPlayback();
     }
 
-    // Ask user if they want perfectly timed subtitles generated
     bool? generateSubtitles = await showDialog<bool>(
       context: context,
       builder: (context) {
@@ -280,7 +489,7 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
       },
     );
 
-    if (generateSubtitles == null) return; // User closed dialog
+    if (generateSubtitles == null) return; 
 
     String? outputFile = await FilePicker.platform.saveFile(
       dialogTitle: 'Save Audio As...',
@@ -295,13 +504,18 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
       outputFile += '.wav';
     }
 
-    setState(() => _isGenerating = true);
+    setState(() {
+      _isGenerating = true;
+      _isSaving = true;
+      _saveProgress = 0.0;
+      _saveEta = "Calculating ETA...";
+    });
 
     try {
       final outFile = File(outputFile);
       if (await outFile.exists()) await outFile.delete();
 
-      List<String>? chunksForSubtitles = generateSubtitles ? _splitIntoSentences(text) : null;
+      List<String> chunksForExport = _splitIntoSentences(text);
 
       bool success = await _piperService.generateToFile(
         text,
@@ -309,7 +523,16 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
         modelPath: _modelPath,
         speed: _speechSpeed,
         speakerId: _speakerId,
-        chunksForSubtitles: chunksForSubtitles,
+        exportChunks: chunksForExport,
+        isSubtitlesRequested: generateSubtitles,
+        onProgress: (current, total, eta) {
+          if (mounted) {
+            setState(() {
+              _saveProgress = current / total;
+              _saveEta = "$current / $total chunks  •  ETA: $eta";
+            });
+          }
+        }
       );
 
       if (success && mounted && await outFile.exists()) {
@@ -326,73 +549,207 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error saving audio: $e')));
       }
     } finally {
-      if (mounted) setState(() => _isGenerating = false);
+      if (mounted) {
+        setState(() {
+          _isGenerating = false;
+          _isSaving = false;
+        });
+      }
     }
   }
 
   void _showFindReplaceDialog() {
     final findController = TextEditingController();
     final replaceController = TextEditingController();
+    double minLineLength = 40; 
+    bool smartJoinLabels = false; 
+    bool stripSpecialChars = false; 
 
     showDialog(
       context: context,
       builder: (context) {
-        return AlertDialog(
-          backgroundColor: const Color(0xFF1E1E1E),
-          title: const Text('Clean Text / Find & Replace'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              ElevatedButton.icon(
-                icon: const Icon(Icons.auto_fix_high),
-                label: const Text('Quick Clean AI Formats (Markdown, ***)'),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.blueGrey.shade700,
-                  foregroundColor: Colors.white,
-                  minimumSize: const Size(double.infinity, 45),
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              backgroundColor: const Color(0xFF1E1E1E),
+              title: const Text('Magic Format Cleaner'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('Quick Clean', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white70)),
+                    CheckboxListTile(
+                      contentPadding: EdgeInsets.zero,
+                      controlAffinity: ListTileControlAffinity.leading,
+                      activeColor: Colors.blueGrey,
+                      title: const Text('Strip emojis & non-standard symbols', style: TextStyle(color: Colors.white70, fontSize: 13)),
+                      value: stripSpecialChars,
+                      onChanged: (val) {
+                        setDialogState(() => stripSpecialChars = val ?? false);
+                      },
+                    ),
+                    ElevatedButton.icon(
+                      icon: const Icon(Icons.auto_fix_high),
+                      label: const Text('Clean AI Formats (Markdown, ***)'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.blueGrey.shade700,
+                        foregroundColor: Colors.white,
+                        minimumSize: const Size(double.infinity, 45),
+                      ),
+                      onPressed: () {
+                        _saveStateForUndo(); 
+                        
+                        String currentText = _textController.text;
+                        
+                        if (stripSpecialChars) {
+                          currentText = currentText.replaceAll(RegExp(r'[^\p{L}\p{N}\p{P}\p{Z}\n]', unicode: true), '');
+                        }
+                        
+                        currentText = currentText.replaceAll(RegExp(r'\*\*|\*|__|_'), '');
+                        currentText = currentText.replaceAll(RegExp(r'###|##|#'), '');
+                        currentText = currentText.replaceAll(RegExp(r'^\s*Sure[!,]?\s*.*?:', multiLine: true, caseSensitive: false), '');
+                        
+                        _textController.text = currentText;
+                        Navigator.pop(context);
+                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Text cleaned!')));
+                      },
+                    ),
+                    const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 16.0),
+                      child: Divider(color: Colors.white24),
+                    ),
+
+                    const Text('Fix Broken Lines (PDF/Copy-Paste)', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white70)),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'Joins chopped text back into paragraphs. Lines shorter than the minimum are kept on their own line (useful for titles or list items).', 
+                      style: TextStyle(fontSize: 12, color: Colors.white54)
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text('Min Length to Join:', style: TextStyle(color: Colors.white70, fontSize: 14)),
+                        Text('${minLineLength.toInt()} chars', style: const TextStyle(fontWeight: FontWeight.bold)),
+                      ],
+                    ),
+                    Slider(
+                      value: minLineLength,
+                      min: 10,
+                      max: 100,
+                      divisions: 90,
+                      label: minLineLength.toInt().toString(),
+                      onChanged: (val) {
+                        setDialogState(() => minLineLength = val);
+                      },
+                    ),
+                    CheckboxListTile(
+                      contentPadding: EdgeInsets.zero,
+                      controlAffinity: ListTileControlAffinity.leading,
+                      activeColor: Colors.blueGrey,
+                      title: const Text('Smart-join short labels (e.g. "Q", "A", "Speaker:")', style: TextStyle(color: Colors.white70, fontSize: 13)),
+                      value: smartJoinLabels,
+                      onChanged: (val) {
+                        setDialogState(() => smartJoinLabels = val ?? false);
+                      },
+                    ),
+                    const SizedBox(height: 8),
+                    ElevatedButton.icon(
+                      icon: const Icon(Icons.wrap_text),
+                      label: const Text('Fix Line Breaks'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.blueGrey.shade700,
+                        foregroundColor: Colors.white,
+                        minimumSize: const Size(double.infinity, 45),
+                      ),
+                      onPressed: () {
+                        _saveStateForUndo(); 
+                        
+                        List<String> lines = _textController.text.split('\n');
+                        List<String> result = [];
+                        String currentParagraph = "";
+                        
+                        for (int i = 0; i < lines.length; i++) {
+                          String line = lines[i].trimRight();
+                          
+                          if (line.trim().isEmpty) {
+                            if (currentParagraph.isNotEmpty) {
+                              result.add(currentParagraph);
+                              currentParagraph = "";
+                            }
+                            result.add(""); 
+                            continue;
+                          }
+                          
+                          if (currentParagraph.isEmpty) {
+                            currentParagraph = line.trimLeft();
+                          } else {
+                            currentParagraph += " ${line.trimLeft()}";
+                          }
+                          
+                          bool shouldJoinToNext = false;
+                          
+                          if (line.length >= minLineLength.toInt()) {
+                            shouldJoinToNext = true; 
+                          } else if (smartJoinLabels && (line.length <= 3 || line.endsWith(':'))) {
+                            shouldJoinToNext = true; 
+                          }
+                          
+                          if (!shouldJoinToNext) {
+                            result.add(currentParagraph);
+                            currentParagraph = "";
+                          }
+                        }
+                        
+                        if (currentParagraph.isNotEmpty) {
+                          result.add(currentParagraph);
+                        }
+                        
+                        _textController.text = result.join('\n').replaceAll(RegExp(r' {2,}'), ' ');
+                        
+                        Navigator.pop(context);
+                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Line breaks fixed!')));
+                      },
+                    ),
+                    const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 16.0),
+                      child: Divider(color: Colors.white24),
+                    ),
+
+                    const Text('Find & Replace', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white70)),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: findController,
+                      decoration: const InputDecoration(labelText: 'Find', filled: true, fillColor: Colors.black12),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: replaceController,
+                      decoration: const InputDecoration(labelText: 'Replace with', filled: true, fillColor: Colors.black12),
+                    ),
+                  ],
                 ),
-                onPressed: () {
-                  String currentText = _textController.text;
-                  currentText = currentText.replaceAll(RegExp(r'\*\*|\*|__|_'), '');
-                  currentText = currentText.replaceAll(RegExp(r'###|##|#'), '');
-                  currentText = currentText.replaceAll(RegExp(r'^\s*Sure[!,]?\s*.*?:', multiLine: true, caseSensitive: false), '');
-                  
-                  _textController.text = currentText;
-                  Navigator.pop(context);
-                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('AI formatting removed!')));
-                },
               ),
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 16.0),
-                child: Divider(color: Colors.white24),
-              ),
-              TextField(
-                controller: findController,
-                decoration: const InputDecoration(labelText: 'Find', filled: true, fillColor: Colors.black12),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: replaceController,
-                decoration: const InputDecoration(labelText: 'Replace with', filled: true, fillColor: Colors.black12),
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('Cancel'),
-            ),
-            ElevatedButton(
-              onPressed: () {
-                final findText = findController.text;
-                if (findText.isNotEmpty) {
-                  _textController.text = _textController.text.replaceAll(findText, replaceController.text);
-                  Navigator.pop(context);
-                }
-              },
-              child: const Text('Replace All'),
-            ),
-          ],
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('Cancel'),
+                ),
+                ElevatedButton(
+                  onPressed: () {
+                    final findText = findController.text;
+                    if (findText.isNotEmpty) {
+                      _saveStateForUndo(); 
+                      _textController.text = _textController.text.replaceAll(findText, replaceController.text);
+                      Navigator.pop(context);
+                    }
+                  },
+                  child: const Text('Replace All'),
+                ),
+              ],
+            );
+          }
         );
       },
     );
@@ -546,105 +903,262 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
     final isButtonDisabled = !_piperService.isInitialized || (_textController.text.trim().isEmpty && !_isPlaying && !_isGenerating);
     final isSaveDisabled = isButtonDisabled || _isGenerating || _isPlaying;
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('EchoText', style: TextStyle(fontWeight: FontWeight.w600, letterSpacing: 0.5)),
-        centerTitle: false,
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.auto_fix_high),
-            tooltip: 'Clean AI Formatting / Find & Replace',
-            onPressed: () => _showFindReplaceDialog(),
-          ),
-          IconButton(
-            icon: const Icon(Icons.save_alt),
-            tooltip: 'Save Audio (.wav)',
-            onPressed: isSaveDisabled ? null : _handleSaveAudio,
-          ),
-          IconButton(
-            icon: const Icon(Icons.clear_all),
-            tooltip: 'Clear Text',
-            onPressed: () {
-              _textController.clear();
-              if (_isPlaying || _isGenerating) _handlePlayStop();
+    return Shortcuts(
+      shortcuts: <ShortcutActivator, Intent>{
+        LogicalKeySet(Platform.isMacOS ? LogicalKeyboardKey.meta : LogicalKeyboardKey.control, LogicalKeyboardKey.keyF): const SearchIntent(),
+      },
+      child: Actions(
+        actions: <Type, Action<Intent>>{
+          SearchIntent: CallbackAction<SearchIntent>(
+            onInvoke: (SearchIntent intent) {
+              setState(() {
+                _isSearching = true;
+              });
+              _searchFocusNode.requestFocus();
+              return null;
             },
           ),
-          IconButton(
-            icon: const Icon(Icons.settings_outlined),
-            tooltip: 'Settings',
-            onPressed: _showSettingsSheet,
-          ),
-          const SizedBox(width: 16),
-        ],
-      ),
-      body: Padding(
-        padding: const EdgeInsets.only(left: 32.0, top: 16.0, right: 32.0, bottom: 96.0),
-        child: Column(
-          children: [
-            Expanded(
-              child: Container(
-                width: double.infinity,
-                decoration: BoxDecoration(
-                  color: const Color(0xFF1E1E1E),
-                  border: Border.all(color: Colors.white12),
-                  borderRadius: BorderRadius.circular(16),
+        },
+        child: Scaffold(
+          appBar: AppBar(
+            title: const Text('EchoText', style: TextStyle(fontWeight: FontWeight.w600, letterSpacing: 0.5)),
+            centerTitle: false,
+            actions: [
+              IconButton(
+                icon: const Icon(Icons.search),
+                tooltip: 'Search (Ctrl+F)',
+                onPressed: () {
+                  setState(() { _isSearching = true; });
+                  _searchFocusNode.requestFocus();
+                },
+              ),
+              if (_isPlaying || _isGenerating) 
+                IconButton(
+                  icon: const Icon(Icons.stop),
+                  tooltip: 'Stop playback/generation',
+                  onPressed: _stopPlayback,
+                )
+              else
+                IconButton(
+                  icon: const Icon(Icons.play_arrow),
+                  tooltip: 'Read text from cursor',
+                  onPressed: isButtonDisabled ? null : _startPlaybackFromCursor,
                 ),
-                child: !_isPlaying 
-                ? TextField(
-                    controller: _textController,
-                    scrollController: _scrollController, 
-                    focusNode: _textFocusNode,           
-                    maxLines: null,
-                    expands: true,
-                    textAlignVertical: TextAlignVertical.top,
-                    decoration: const InputDecoration(
-                      hintText: 'Paste or type text here to read...',
-                      hintStyle: TextStyle(color: Colors.white38),
-                      border: InputBorder.none,
-                      contentPadding: EdgeInsets.all(24),
+              
+              IconButton(
+                icon: const Icon(Icons.undo),
+                tooltip: 'Undo last bulk action',
+                onPressed: _undoStack.isNotEmpty ? _handleUndo : null,
+              ),
+              IconButton(
+                icon: const Icon(Icons.auto_fix_high),
+                tooltip: 'Clean AI Formatting / Find & Replace',
+                onPressed: () => _showFindReplaceDialog(),
+              ),
+              IconButton(
+                icon: const Icon(Icons.save_alt),
+                tooltip: 'Save Audio (.wav)',
+                onPressed: isSaveDisabled ? null : _handleSaveAudio,
+              ),
+              IconButton(
+                icon: const Icon(Icons.clear_all),
+                tooltip: 'Clear Text',
+                onPressed: () {
+                  if (_textController.text.isNotEmpty) {
+                    _saveStateForUndo(); 
+                    _textController.clear();
+                  }
+                  if (_isPlaying || _isGenerating) _stopPlayback();
+                },
+              ),
+              IconButton(
+                icon: const Icon(Icons.settings_outlined),
+                tooltip: 'Settings',
+                onPressed: _showSettingsSheet,
+              ),
+              const SizedBox(width: 16),
+            ],
+          ),
+          body: Padding(
+            padding: const EdgeInsets.only(left: 32.0, top: 16.0, right: 32.0, bottom: 24.0),
+            child: Column(
+              children: [
+                // --- SEARCH BAR UI ---
+                if (_isSearching)
+                  Container(
+                    margin: const EdgeInsets.only(bottom: 16.0),
+                    padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF2C2C2C),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.white12)
                     ),
-                    style: const TextStyle(fontSize: 18, height: 1.6, color: Colors.white70),
-                  )
-                : SingleChildScrollView(
-                    controller: _scrollController, 
-                    padding: const EdgeInsets.all(24),
-                    child: RichText(
-                      text: TextSpan(
-                        style: const TextStyle(fontSize: 18, height: 1.6, color: Colors.white70),
-                        children: List.generate(_textChunks.length, (index) {
-                          final isCurrent = _currentChunkIndex == index;
-                          return TextSpan(
-                            text: _textChunks[index],
-                            style: isCurrent
-                                ? const TextStyle(
-                                    backgroundColor: Colors.blueGrey,
-                                    color: Colors.white,
-                                  )
-                                : null,
-                            mouseCursor: SystemMouseCursors.click,
-                            recognizer: _recognizers.isNotEmpty && index < _recognizers.length 
-                                ? _recognizers[index] 
-                                : null,
-                          );
-                        }),
-                      ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.search, color: Colors.white54),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: TextField(
+                            controller: _searchController,
+                            focusNode: _searchFocusNode,
+                            decoration: const InputDecoration(
+                              hintText: "Find in text... (min 3 chars)",
+                              hintStyle: TextStyle(color: Colors.white38),
+                              border: InputBorder.none,
+                              isDense: true,
+                            ),
+                            style: const TextStyle(color: Colors.white),
+                            onChanged: _updateSearch,
+                            onSubmitted: (_) => _nextSearchMatch(),
+                          ),
+                        ),
+                        if (_searchMatchIndices.isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 16.0),
+                            child: Text(
+                              '${_currentSearchMatch + 1} of ${_searchMatchIndices.length}', 
+                              style: const TextStyle(color: Colors.white54)
+                            ),
+                          )
+                        else if (_searchQuery.isNotEmpty && _searchQuery.length >= 3)
+                          const Padding(
+                            padding: EdgeInsets.symmetric(horizontal: 16.0),
+                            child: Text('0 matches', style: TextStyle(color: Colors.white54)),
+                          )
+                        else if (_searchQuery.isNotEmpty && _searchQuery.length < 3)
+                          const Padding(
+                            padding: EdgeInsets.symmetric(horizontal: 16.0),
+                            child: Text('Type at least 3 chars...', style: TextStyle(color: Colors.white38, fontStyle: FontStyle.italic)),
+                          ),
+                        IconButton(
+                          icon: const Icon(Icons.keyboard_arrow_up, color: Colors.white),
+                          onPressed: _prevSearchMatch,
+                          tooltip: 'Previous match',
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.keyboard_arrow_down, color: Colors.white),
+                          onPressed: _nextSearchMatch,
+                          tooltip: 'Next match',
+                        ),
+                        Container(width: 1, height: 24, color: Colors.white24, margin: const EdgeInsets.symmetric(horizontal: 8)),
+                        IconButton(
+                          icon: const Icon(Icons.close, color: Colors.white),
+                          onPressed: () {
+                            setState(() {
+                              _isSearching = false;
+                              _searchQuery = "";
+                              _searchController.clear();
+                              _textController.searchQuery = "";
+                              _textController.activeSearchMatchIndex = -1;
+                              _searchMatchIndices.clear();
+                            });
+                          },
+                          tooltip: 'Close search',
+                        ),
+                      ],
                     ),
                   ),
-              ),
+
+                Expanded(
+                  child: Stack(
+                    children: [
+                      // The Main Text Editor
+                      Positioned.fill(
+                        child: Container(
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF1E1E1E),
+                            border: Border.all(color: Colors.white12),
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                          child: Listener(
+                            onPointerDown: (event) {
+                              int now = DateTime.now().millisecondsSinceEpoch;
+                              if (now - _lastEditorTapTime < 300) {
+                                Future.delayed(const Duration(milliseconds: 100), () {
+                                  if (mounted && !_isPlaying && !_isGenerating) {
+                                    _startPlaybackFromCursor();
+                                  }
+                                });
+                              }
+                              _lastEditorTapTime = now;
+                            },
+                            child: TextField(
+                              controller: _textController,
+                              scrollController: _scrollController, 
+                              focusNode: _textFocusNode,           
+                              maxLines: null,
+                              expands: true,
+                              readOnly: _isPlaying || _isGenerating, 
+                              textAlignVertical: TextAlignVertical.top,
+                              onTap: () {
+                                if (_isPlaying) {
+                                  int newIndex = _getChunkIndexFromCursor();
+                                  if (newIndex != _currentChunkIndex) {
+                                    _startPlayback(newIndex);
+                                  }
+                                }
+                              },
+                              contextMenuBuilder: (BuildContext context, EditableTextState editableTextState) {
+                                final List<ContextMenuButtonItem> buttonItems = editableTextState.contextMenuButtonItems.toList();
+                                if (!_isPlaying && !_isGenerating) {
+                                  buttonItems.insert(0, ContextMenuButtonItem(
+                                    label: '🔊 Read from here',
+                                    onPressed: () {
+                                      ContextMenuController.removeAny();
+                                      _startPlaybackFromCursor();
+                                    },
+                                  ));
+                                }
+                                return AdaptiveTextSelectionToolbar.buttonItems(
+                                  anchors: editableTextState.contextMenuAnchors,
+                                  buttonItems: buttonItems,
+                                );
+                              },
+                              decoration: const InputDecoration(
+                                hintText: 'Paste or type text here to read...',
+                                hintStyle: TextStyle(color: Colors.white38),
+                                border: InputBorder.none,
+                                contentPadding: EdgeInsets.all(24),
+                              ),
+                              style: const TextStyle(fontSize: 18, height: 1.6, color: Colors.white70),
+                            ),
+                          ),
+                        ),
+                      ),
+                      
+                      if (_isGenerating)
+                        Positioned(
+                          left: 1, 
+                          right: 1, 
+                          bottom: 1, 
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 24),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF1E1E1E).withOpacity(0.95),
+                              borderRadius: const BorderRadius.vertical(bottom: Radius.circular(15)),
+                              border: const Border(top: BorderSide(color: Colors.white12)),
+                            ),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                if (_isSaving) ...[
+                                  LinearProgressIndicator(value: _saveProgress, backgroundColor: Colors.white10, color: Colors.blueGrey),
+                                  const SizedBox(height: 8),
+                                  Text(_saveEta, style: const TextStyle(color: Colors.white54, fontSize: 13, fontWeight: FontWeight.bold)),
+                                ] else ...[
+                                  const LinearProgressIndicator(backgroundColor: Colors.white10, color: Colors.blueGrey),
+                                ]
+                              ],
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ],
             ),
-            if (_isGenerating) ...[
-              const SizedBox(height: 24),
-              const LinearProgressIndicator(backgroundColor: Colors.white10, color: Colors.blueGrey),
-            ],
-          ],
+          ),
         ),
-      ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: isButtonDisabled ? null : _handlePlayStop,
-        icon: Icon((_isPlaying || _isGenerating) ? Icons.stop : Icons.play_arrow),
-        label: Text((_isPlaying || _isGenerating) ? 'Stop' : 'Read Text'),
-        backgroundColor: (_isPlaying || _isGenerating) ? Colors.red.shade700 : Colors.blueGrey.shade700,
-        foregroundColor: Colors.white,
       ),
     );
   }
