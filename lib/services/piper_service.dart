@@ -329,8 +329,9 @@ class PiperService {
                numChannels = view.getUint16(fmtOffset + 10, Endian.little);
                sampleRate = view.getUint32(fmtOffset + 12, Endian.little);
                byteRate = view.getUint32(fmtOffset + 16, Endian.little);
-               blockAlign = view.getUint16(fmtOffset + 32, Endian.little);
-               bitsPerSample = view.getUint16(fmtOffset + 34, Endian.little);
+               // BUG FIX: Corrected relative offsets to 20 and 22 so we grab actual header data
+               blockAlign = view.getUint16(fmtOffset + 20, Endian.little);
+               bitsPerSample = view.getUint16(fmtOffset + 22, Endian.little);
              }
              
              int dataSize = view.getUint32(dataOffset + 4, Endian.little);
