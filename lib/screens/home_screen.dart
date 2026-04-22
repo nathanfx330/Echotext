@@ -10,103 +10,12 @@ import 'package:file_picker/file_picker.dart';
 
 import '../models/voice_model.dart';
 import '../services/piper_service.dart';
-
-// Intent to handle Ctrl+F Search
-class SearchIntent extends Intent { const SearchIntent(); }
-
-// --- CUSTOM HIGHLIGHTING CONTROLLER ---
-class HighlightingTextEditingController extends TextEditingController {
-  int _highlightedChunkIndex = -1;
-  List<String> _chunks = [];
-  
-  String _searchQuery = "";
-  int _activeSearchMatchIndex = -1;
-
-  int get highlightedChunkIndex => _highlightedChunkIndex;
-  set highlightedChunkIndex(int value) {
-    if (_highlightedChunkIndex != value) {
-      _highlightedChunkIndex = value;
-      notifyListeners();
-    }
-  }
-
-  List<String> get chunks => _chunks;
-  set chunks(List<String> value) {
-    _chunks = value;
-    notifyListeners();
-  }
-
-  String get searchQuery => _searchQuery;
-  set searchQuery(String value) {
-    if (_searchQuery != value) {
-      _searchQuery = value;
-      notifyListeners();
-    }
-  }
-
-  int get activeSearchMatchIndex => _activeSearchMatchIndex;
-  set activeSearchMatchIndex(int value) {
-    if (_activeSearchMatchIndex != value) {
-      _activeSearchMatchIndex = value;
-      notifyListeners();
-    }
-  }
-
-  @override
-  TextSpan buildTextSpan({required BuildContext context, TextStyle? style, required bool withComposing}) {
-    // 1. Playback Chunk Highlighting
-    if (_highlightedChunkIndex >= 0 && _highlightedChunkIndex < _chunks.length && _chunks.isNotEmpty) {
-      List<TextSpan> spans = [];
-      int currentIndex = 0;
-      for (int i = 0; i < _chunks.length; i++) {
-        final chunk = _chunks[i];
-        if (currentIndex >= text.length) break;
-        spans.add(TextSpan(
-          text: chunk,
-          style: i == _highlightedChunkIndex
-              ? style?.copyWith(backgroundColor: Colors.blueGrey, color: Colors.white)
-              : style,
-        ));
-        currentIndex += chunk.length;
-      }
-      return TextSpan(style: style, children: spans);
-    }
-
-    // 2. Ctrl+F Search Highlighting
-    if (_searchQuery.isNotEmpty && _searchQuery.length >= 3) {
-      List<TextSpan> spans = [];
-      int start = 0;
-      String lowerText = text.toLowerCase();
-      String lowerQuery = _searchQuery.toLowerCase();
-      int queryLen = lowerQuery.length;
-
-      int index = lowerText.indexOf(lowerQuery, start);
-      while (index >= 0) {
-        if (index > start) {
-          spans.add(TextSpan(text: text.substring(start, index), style: style));
-        }
-        bool isActive = index == _activeSearchMatchIndex;
-        spans.add(TextSpan(
-          text: text.substring(index, index + queryLen),
-          style: style?.copyWith(
-            backgroundColor: isActive ? Colors.orangeAccent : Colors.blueGrey.withOpacity(0.6),
-            color: isActive ? Colors.black : Colors.white,
-          ),
-        ));
-        start = index + queryLen;
-        index = lowerText.indexOf(lowerQuery, start);
-      }
-      if (start < text.length) {
-        spans.add(TextSpan(text: text.substring(start), style: style));
-      }
-      return TextSpan(style: style, children: spans);
-    }
-
-    // Default
-    return TextSpan(style: style, text: text);
-  }
-}
-// --------------------------------------
+import '../controllers/highlighting_text_controller.dart';
+import '../utils/text_helpers.dart';
+import '../widgets/dialogs/magic_cleaner_dialog.dart';
+import '../widgets/sheets/settings_sheet.dart';
+import '../widgets/editor/search_bar_header.dart';
+import '../widgets/editor/export_progress_overlay.dart'; 
 
 class EchoTextScreen extends StatefulWidget {
   const EchoTextScreen({super.key});
@@ -140,8 +49,9 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
   double _saveProgress = 0.0;
   String _saveEta = "";
   
-  // Undo & Text State
-  final List<String> _undoStack = [];
+  // Dynamic Undo State
+  String? _textBeforeClear;
+  Timer? _undoClearTimer;
   String _lastSavedText = "";
 
   // Playback State
@@ -172,12 +82,18 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
     _speakerId = _prefs.getInt('speaker_id') ?? 0;
 
     _textController.addListener(() {
-      // Fix: Only run heavy logic if the physical text changes (ignores cursor selection changes)
       if (_textController.text != _lastSavedText) {
         _lastSavedText = _textController.text;
         _prefs.setString('saved_text', _textController.text);
         if (_isSearching) _updateSearch(_searchController.text); 
-        setState(() {}); 
+        
+        // If the user starts typing, cancel the temporary Undo state
+        if (_textBeforeClear != null && _textController.text.isNotEmpty) {
+          setState(() => _textBeforeClear = null);
+          _undoClearTimer?.cancel();
+        } else {
+          setState(() {}); 
+        }
       }
     });
 
@@ -202,6 +118,7 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
   @override
   void dispose() {
     _searchDebounceTimer?.cancel();
+    _undoClearTimer?.cancel();
     _textController.dispose();
     _scrollController.dispose();
     _textFocusNode.dispose();
@@ -269,7 +186,6 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
       
       _textController.selection = TextSelection(baseOffset: offset, extentOffset: offset + _searchQuery.length);
       
-      // Fix: The "Focus Bounce" Hack. Forces the TextField to auto-scroll off-screen matches.
       bool wasFocused = _textFocusNode.hasFocus;
       if (!wasFocused) {
         _textFocusNode.requestFocus();
@@ -287,33 +203,6 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
     }
   }
   // --------------------
-
-  // --- UNDO LOGIC ---
-  void _saveStateForUndo() {
-    final currentText = _textController.text;
-    if (_undoStack.isEmpty || _undoStack.last != currentText) {
-      _undoStack.add(currentText);
-      if (_undoStack.length > 20) {
-        _undoStack.removeAt(0); 
-      }
-      setState(() {});
-    }
-  }
-
-  void _handleUndo() {
-    if (_undoStack.isNotEmpty) {
-      setState(() {
-        _textController.text = _undoStack.removeLast();
-      });
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Action undone.')));
-    }
-  }
-
-  List<String> _splitIntoSentences(String text) {
-    final RegExp sentenceRegex = RegExp(r'.*?[.!?\n]+|.+');
-    final Iterable<Match> matches = sentenceRegex.allMatches(text);
-    return matches.map((m) => m.group(0)!).toList();
-  }
 
   int _getChunkIndexFromCursor() {
     int cursorOffset = _textController.selection.baseOffset;
@@ -358,7 +247,7 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
       return;
     }
 
-    _textChunks = _splitIntoSentences(_textController.text);
+    _textChunks = TextHelpers.splitIntoSentences(_textController.text);
     int startIndex = _getChunkIndexFromCursor();
 
     FocusScope.of(context).unfocus();
@@ -515,7 +404,7 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
       final outFile = File(outputFile);
       if (await outFile.exists()) await outFile.delete();
 
-      List<String> chunksForExport = _splitIntoSentences(text);
+      List<String> chunksForExport = TextHelpers.splitIntoSentences(text);
 
       bool success = await _piperService.generateToFile(
         text,
@@ -558,201 +447,17 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
     }
   }
 
-  void _showFindReplaceDialog() {
-    final findController = TextEditingController();
-    final replaceController = TextEditingController();
-    double minLineLength = 40; 
-    bool smartJoinLabels = false; 
-    bool stripSpecialChars = false; 
-
-    showDialog(
+  Future<void> _showFindReplaceDialog() async {
+    final String? newText = await showDialog<String>(
       context: context,
-      builder: (context) {
-        return StatefulBuilder(
-          builder: (context, setDialogState) {
-            return AlertDialog(
-              backgroundColor: const Color(0xFF1E1E1E),
-              title: const Text('Magic Format Cleaner'),
-              content: SingleChildScrollView(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('Quick Clean', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white70)),
-                    CheckboxListTile(
-                      contentPadding: EdgeInsets.zero,
-                      controlAffinity: ListTileControlAffinity.leading,
-                      activeColor: Colors.blueGrey,
-                      title: const Text('Strip emojis & non-standard symbols', style: TextStyle(color: Colors.white70, fontSize: 13)),
-                      value: stripSpecialChars,
-                      onChanged: (val) {
-                        setDialogState(() => stripSpecialChars = val ?? false);
-                      },
-                    ),
-                    ElevatedButton.icon(
-                      icon: const Icon(Icons.auto_fix_high),
-                      label: const Text('Clean AI Formats (Markdown, ***)'),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.blueGrey.shade700,
-                        foregroundColor: Colors.white,
-                        minimumSize: const Size(double.infinity, 45),
-                      ),
-                      onPressed: () {
-                        _saveStateForUndo(); 
-                        
-                        String currentText = _textController.text;
-                        
-                        if (stripSpecialChars) {
-                          currentText = currentText.replaceAll(RegExp(r'[^\p{L}\p{N}\p{P}\p{Z}\n]', unicode: true), '');
-                        }
-                        
-                        currentText = currentText.replaceAll(RegExp(r'\*\*|\*|__|_'), '');
-                        currentText = currentText.replaceAll(RegExp(r'###|##|#'), '');
-                        currentText = currentText.replaceAll(RegExp(r'^\s*Sure[!,]?\s*.*?:', multiLine: true, caseSensitive: false), '');
-                        
-                        _textController.text = currentText;
-                        Navigator.pop(context);
-                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Text cleaned!')));
-                      },
-                    ),
-                    const Padding(
-                      padding: EdgeInsets.symmetric(vertical: 16.0),
-                      child: Divider(color: Colors.white24),
-                    ),
-
-                    const Text('Fix Broken Lines (PDF/Copy-Paste)', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white70)),
-                    const SizedBox(height: 8),
-                    const Text(
-                      'Joins chopped text back into paragraphs. Lines shorter than the minimum are kept on their own line (useful for titles or list items).', 
-                      style: TextStyle(fontSize: 12, color: Colors.white54)
-                    ),
-                    const SizedBox(height: 12),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        const Text('Min Length to Join:', style: TextStyle(color: Colors.white70, fontSize: 14)),
-                        Text('${minLineLength.toInt()} chars', style: const TextStyle(fontWeight: FontWeight.bold)),
-                      ],
-                    ),
-                    Slider(
-                      value: minLineLength,
-                      min: 10,
-                      max: 100,
-                      divisions: 90,
-                      label: minLineLength.toInt().toString(),
-                      onChanged: (val) {
-                        setDialogState(() => minLineLength = val);
-                      },
-                    ),
-                    CheckboxListTile(
-                      contentPadding: EdgeInsets.zero,
-                      controlAffinity: ListTileControlAffinity.leading,
-                      activeColor: Colors.blueGrey,
-                      title: const Text('Smart-join short labels (e.g. "Q", "A", "Speaker:")', style: TextStyle(color: Colors.white70, fontSize: 13)),
-                      value: smartJoinLabels,
-                      onChanged: (val) {
-                        setDialogState(() => smartJoinLabels = val ?? false);
-                      },
-                    ),
-                    const SizedBox(height: 8),
-                    ElevatedButton.icon(
-                      icon: const Icon(Icons.wrap_text),
-                      label: const Text('Fix Line Breaks'),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.blueGrey.shade700,
-                        foregroundColor: Colors.white,
-                        minimumSize: const Size(double.infinity, 45),
-                      ),
-                      onPressed: () {
-                        _saveStateForUndo(); 
-                        
-                        List<String> lines = _textController.text.split('\n');
-                        List<String> result = [];
-                        String currentParagraph = "";
-                        
-                        for (int i = 0; i < lines.length; i++) {
-                          String line = lines[i].trimRight();
-                          
-                          if (line.trim().isEmpty) {
-                            if (currentParagraph.isNotEmpty) {
-                              result.add(currentParagraph);
-                              currentParagraph = "";
-                            }
-                            result.add(""); 
-                            continue;
-                          }
-                          
-                          if (currentParagraph.isEmpty) {
-                            currentParagraph = line.trimLeft();
-                          } else {
-                            currentParagraph += " ${line.trimLeft()}";
-                          }
-                          
-                          bool shouldJoinToNext = false;
-                          
-                          if (line.length >= minLineLength.toInt()) {
-                            shouldJoinToNext = true; 
-                          } else if (smartJoinLabels && (line.length <= 3 || line.endsWith(':'))) {
-                            shouldJoinToNext = true; 
-                          }
-                          
-                          if (!shouldJoinToNext) {
-                            result.add(currentParagraph);
-                            currentParagraph = "";
-                          }
-                        }
-                        
-                        if (currentParagraph.isNotEmpty) {
-                          result.add(currentParagraph);
-                        }
-                        
-                        _textController.text = result.join('\n').replaceAll(RegExp(r' {2,}'), ' ');
-                        
-                        Navigator.pop(context);
-                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Line breaks fixed!')));
-                      },
-                    ),
-                    const Padding(
-                      padding: EdgeInsets.symmetric(vertical: 16.0),
-                      child: Divider(color: Colors.white24),
-                    ),
-
-                    const Text('Find & Replace', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white70)),
-                    const SizedBox(height: 8),
-                    TextField(
-                      controller: findController,
-                      decoration: const InputDecoration(labelText: 'Find', filled: true, fillColor: Colors.black12),
-                    ),
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: replaceController,
-                      decoration: const InputDecoration(labelText: 'Replace with', filled: true, fillColor: Colors.black12),
-                    ),
-                  ],
-                ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(context),
-                  child: const Text('Cancel'),
-                ),
-                ElevatedButton(
-                  onPressed: () {
-                    final findText = findController.text;
-                    if (findText.isNotEmpty) {
-                      _saveStateForUndo(); 
-                      _textController.text = _textController.text.replaceAll(findText, replaceController.text);
-                      Navigator.pop(context);
-                    }
-                  },
-                  child: const Text('Replace All'),
-                ),
-              ],
-            );
-          }
-        );
-      },
+      builder: (context) => MagicCleanerDialog(initialText: _textController.text),
     );
+
+    if (newText != null && newText != _textController.text) {
+      setState(() {
+        _textController.text = newText;
+      });
+    }
   }
 
   Future<void> _pickCustomModel() async {
@@ -795,103 +500,33 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
       builder: (context) {
         return StatefulBuilder(builder: (context, setSheetState) {
-          return Padding(
-            padding: const EdgeInsets.all(24.0),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text('Voice Settings', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-                const SizedBox(height: 24),
-
-                const Text('Current Model:', style: TextStyle(color: Colors.white70)),
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    Expanded(
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 16),
-                        decoration: BoxDecoration(color: Colors.white10, borderRadius: BorderRadius.circular(8)),
-                        child: DropdownButtonHideUnderline(
-                          child: DropdownButton<VoiceModel>(
-                            isExpanded: true,
-                            value: _selectedVoice,
-                            dropdownColor: const Color(0xFF2C2C2C),
-                            hint: const Text('No voices found in model/ folder'),
-                            items: _piperService.availableVoices.map((voice) {
-                              return DropdownMenuItem<VoiceModel>(
-                                value: voice,
-                                child: Text(voice.name, overflow: TextOverflow.ellipsis),
-                              );
-                            }).toList(),
-                            onChanged: (VoiceModel? newVoice) {
-                              if (newVoice != null) {
-                                setSheetState(() {
-                                  _selectedVoice = newVoice;
-                                  _modelPath = newVoice.path;
-                                });
-                                setState(() => _modelPath = newVoice.path);
-                                _prefs.setString('custom_model_path', newVoice.path);
-                              }
-                            },
-                          ),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Container(
-                      decoration: BoxDecoration(color: Colors.white10, borderRadius: BorderRadius.circular(8)),
-                      child: IconButton(
-                        icon: const Icon(Icons.folder_open),
-                        tooltip: 'Load external .onnx model',
-                        onPressed: () async {
-                          await _pickCustomModel();
-                          setSheetState(() {});
-                        },
-                      ),
-                    )
-                  ],
-                ),
-                const Divider(height: 32, color: Colors.white12),
-                
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text('Speed (Length Scale):', style: TextStyle(color: Colors.white70)),
-                    Text('${_speechSpeed.toStringAsFixed(2)}x'),
-                  ],
-                ),
-                Slider(
-                  value: _speechSpeed,
-                  min: 0.5, max: 2.0, divisions: 15,
-                  label: _speechSpeed.toStringAsFixed(2),
-                  onChanged: (val) {
-                    setSheetState(() => _speechSpeed = val);
-                    setState(() => _speechSpeed = val);
-                    _prefs.setDouble('speech_speed', val);
-                  },
-                ),
-
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text('Speaker ID (Multispeaker):', style: TextStyle(color: Colors.white70)),
-                    Text(_speakerId.toString()),
-                  ],
-                ),
-                Slider(
-                  value: _speakerId.toDouble(),
-                  min: 0, max: 50, divisions: 50,
-                  label: _speakerId.toString(),
-                  onChanged: (val) {
-                    setSheetState(() => _speakerId = val.toInt());
-                    setState(() => _speakerId = val.toInt());
-                    _prefs.setInt('speaker_id', val.toInt());
-                  },
-                ),
-                const SizedBox(height: 16),
-              ],
-            ),
+          return SettingsSheet(
+            selectedVoice: _selectedVoice,
+            availableVoices: _piperService.availableVoices,
+            speechSpeed: _speechSpeed,
+            speakerId: _speakerId,
+            onVoiceSelected: (newVoice) {
+              setSheetState(() => _selectedVoice = newVoice);
+              setState(() {
+                _selectedVoice = newVoice;
+                _modelPath = newVoice.path;
+              });
+              _prefs.setString('custom_model_path', newVoice.path);
+            },
+            onSpeedChanged: (val) {
+              setSheetState(() => _speechSpeed = val);
+              setState(() => _speechSpeed = val);
+              _prefs.setDouble('speech_speed', val);
+            },
+            onSpeakerIdChanged: (val) {
+              setSheetState(() => _speakerId = val);
+              setState(() => _speakerId = val);
+              _prefs.setInt('speaker_id', val);
+            },
+            onPickCustomModel: () async {
+              await _pickCustomModel();
+              setSheetState(() {});
+            },
           );
         });
       }
@@ -946,11 +581,6 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
                 ),
               
               IconButton(
-                icon: const Icon(Icons.undo),
-                tooltip: 'Undo last bulk action',
-                onPressed: _undoStack.isNotEmpty ? _handleUndo : null,
-              ),
-              IconButton(
                 icon: const Icon(Icons.auto_fix_high),
                 tooltip: 'Clean AI Formatting / Find & Replace',
                 onPressed: () => _showFindReplaceDialog(),
@@ -960,17 +590,44 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
                 tooltip: 'Save Audio (.wav)',
                 onPressed: isSaveDisabled ? null : _handleSaveAudio,
               ),
-              IconButton(
-                icon: const Icon(Icons.clear_all),
-                tooltip: 'Clear Text',
-                onPressed: () {
-                  if (_textController.text.isNotEmpty) {
-                    _saveStateForUndo(); 
-                    _textController.clear();
-                  }
-                  if (_isPlaying || _isGenerating) _stopPlayback();
-                },
-              ),
+
+              // --- DYNAMIC CLEAR/UNDO BUTTON ---
+              if (_textBeforeClear != null)
+                IconButton(
+                  icon: const Icon(Icons.undo),
+                  tooltip: 'Undo Clear',
+                  onPressed: () {
+                    setState(() {
+                      _textController.text = _textBeforeClear!;
+                      _textBeforeClear = null;
+                    });
+                    _undoClearTimer?.cancel();
+                  },
+                )
+              else
+                IconButton(
+                  icon: const Icon(Icons.clear_all),
+                  tooltip: 'Clear Text',
+                  onPressed: () {
+                    if (_textController.text.isNotEmpty) {
+                      setState(() {
+                        _textBeforeClear = _textController.text;
+                        _textController.clear();
+                      });
+                      if (_isPlaying || _isGenerating) _stopPlayback();
+
+                      // Set 8-second timer to revert back to Clear button
+                      _undoClearTimer?.cancel();
+                      _undoClearTimer = Timer(const Duration(seconds: 8), () {
+                        if (mounted && _textBeforeClear != null) {
+                          setState(() => _textBeforeClear = null);
+                        }
+                      });
+                    }
+                  },
+                ),
+              // ---------------------------------
+
               IconButton(
                 icon: const Icon(Icons.settings_outlined),
                 tooltip: 'Settings',
@@ -983,86 +640,32 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
             padding: const EdgeInsets.only(left: 32.0, top: 16.0, right: 32.0, bottom: 24.0),
             child: Column(
               children: [
-                // --- SEARCH BAR UI ---
                 if (_isSearching)
-                  Container(
-                    margin: const EdgeInsets.only(bottom: 16.0),
-                    padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF2C2C2C),
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: Colors.white12)
-                    ),
-                    child: Row(
-                      children: [
-                        const Icon(Icons.search, color: Colors.white54),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: TextField(
-                            controller: _searchController,
-                            focusNode: _searchFocusNode,
-                            decoration: const InputDecoration(
-                              hintText: "Find in text... (min 3 chars)",
-                              hintStyle: TextStyle(color: Colors.white38),
-                              border: InputBorder.none,
-                              isDense: true,
-                            ),
-                            style: const TextStyle(color: Colors.white),
-                            onChanged: _updateSearch,
-                            onSubmitted: (_) => _nextSearchMatch(),
-                          ),
-                        ),
-                        if (_searchMatchIndices.isNotEmpty)
-                          Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 16.0),
-                            child: Text(
-                              '${_currentSearchMatch + 1} of ${_searchMatchIndices.length}', 
-                              style: const TextStyle(color: Colors.white54)
-                            ),
-                          )
-                        else if (_searchQuery.isNotEmpty && _searchQuery.length >= 3)
-                          const Padding(
-                            padding: EdgeInsets.symmetric(horizontal: 16.0),
-                            child: Text('0 matches', style: TextStyle(color: Colors.white54)),
-                          )
-                        else if (_searchQuery.isNotEmpty && _searchQuery.length < 3)
-                          const Padding(
-                            padding: EdgeInsets.symmetric(horizontal: 16.0),
-                            child: Text('Type at least 3 chars...', style: TextStyle(color: Colors.white38, fontStyle: FontStyle.italic)),
-                          ),
-                        IconButton(
-                          icon: const Icon(Icons.keyboard_arrow_up, color: Colors.white),
-                          onPressed: _prevSearchMatch,
-                          tooltip: 'Previous match',
-                        ),
-                        IconButton(
-                          icon: const Icon(Icons.keyboard_arrow_down, color: Colors.white),
-                          onPressed: _nextSearchMatch,
-                          tooltip: 'Next match',
-                        ),
-                        Container(width: 1, height: 24, color: Colors.white24, margin: const EdgeInsets.symmetric(horizontal: 8)),
-                        IconButton(
-                          icon: const Icon(Icons.close, color: Colors.white),
-                          onPressed: () {
-                            setState(() {
-                              _isSearching = false;
-                              _searchQuery = "";
-                              _searchController.clear();
-                              _textController.searchQuery = "";
-                              _textController.activeSearchMatchIndex = -1;
-                              _searchMatchIndices.clear();
-                            });
-                          },
-                          tooltip: 'Close search',
-                        ),
-                      ],
-                    ),
+                  SearchBarHeader(
+                    searchController: _searchController,
+                    searchFocusNode: _searchFocusNode,
+                    searchQuery: _searchQuery,
+                    currentMatchIndex: _currentSearchMatch,
+                    totalMatches: _searchMatchIndices.length,
+                    onSearchChanged: _updateSearch,
+                    onSearchSubmitted: _nextSearchMatch,
+                    onPrevMatch: _prevSearchMatch,
+                    onNextMatch: _nextSearchMatch,
+                    onClose: () {
+                      setState(() {
+                        _isSearching = false;
+                        _searchQuery = "";
+                        _searchController.clear();
+                        _textController.searchQuery = "";
+                        _textController.activeSearchMatchIndex = -1;
+                        _searchMatchIndices.clear();
+                      });
+                    },
                   ),
 
                 Expanded(
                   child: Stack(
                     children: [
-                      // The Main Text Editor
                       Positioned.fill(
                         child: Container(
                           decoration: BoxDecoration(
@@ -1127,30 +730,10 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
                       ),
                       
                       if (_isGenerating)
-                        Positioned(
-                          left: 1, 
-                          right: 1, 
-                          bottom: 1, 
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 24),
-                            decoration: BoxDecoration(
-                              color: const Color(0xFF1E1E1E).withOpacity(0.95),
-                              borderRadius: const BorderRadius.vertical(bottom: Radius.circular(15)),
-                              border: const Border(top: BorderSide(color: Colors.white12)),
-                            ),
-                            child: Column(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                if (_isSaving) ...[
-                                  LinearProgressIndicator(value: _saveProgress, backgroundColor: Colors.white10, color: Colors.blueGrey),
-                                  const SizedBox(height: 8),
-                                  Text(_saveEta, style: const TextStyle(color: Colors.white54, fontSize: 13, fontWeight: FontWeight.bold)),
-                                ] else ...[
-                                  const LinearProgressIndicator(backgroundColor: Colors.white10, color: Colors.blueGrey),
-                                ]
-                              ],
-                            ),
-                          ),
+                        ExportProgressOverlay(
+                          isSaving: _isSaving,
+                          saveProgress: _saveProgress,
+                          saveEta: _saveEta,
                         ),
                     ],
                   ),
