@@ -49,9 +49,9 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
   double _saveProgress = 0.0;
   String _saveEta = "";
   
-  // Dynamic Undo State
-  String? _textBeforeClear;
-  Timer? _undoClearTimer;
+  // 20-Step Undo Stack State
+  final List<String> _undoStack = [];
+  bool _isUndoing = false;
   String _lastSavedText = "";
 
   // Playback State
@@ -63,8 +63,7 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
   VoiceModel? _selectedVoice;
   double _speechSpeed = 1.0;
   int _speakerId = 0;
-
-  int _lastEditorTapTime = 0;
+  bool _useGpu = false;
 
   @override
   void initState() {
@@ -80,20 +79,21 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
     _lastSavedText = _textController.text;
     _speechSpeed = _prefs.getDouble('speech_speed') ?? 1.0;
     _speakerId = _prefs.getInt('speaker_id') ?? 0;
+    _useGpu = _prefs.getBool('use_gpu') ?? false;
 
     _textController.addListener(() {
       if (_textController.text != _lastSavedText) {
+        // Only save to undo stack if the user typed it, not if we triggered an Undo
+        if (!_isUndoing && _lastSavedText.isNotEmpty) {
+          _undoStack.add(_lastSavedText);
+          if (_undoStack.length > 20) _undoStack.removeAt(0); // Keep max 20 steps
+        }
+        
         _lastSavedText = _textController.text;
         _prefs.setString('saved_text', _textController.text);
         if (_isSearching) _updateSearch(_searchController.text); 
         
-        // If the user starts typing, cancel the temporary Undo state
-        if (_textBeforeClear != null && _textController.text.isNotEmpty) {
-          setState(() => _textBeforeClear = null);
-          _undoClearTimer?.cancel();
-        } else {
-          setState(() {}); 
-        }
+        setState(() {}); // Rebuild UI to update Undo button visibility
       }
     });
 
@@ -118,7 +118,6 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
   @override
   void dispose() {
     _searchDebounceTimer?.cancel();
-    _undoClearTimer?.cancel();
     _textController.dispose();
     _scrollController.dispose();
     _textFocusNode.dispose();
@@ -126,6 +125,20 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
     _searchFocusNode.dispose();
     _piperService.dispose();
     super.dispose();
+  }
+
+  // --- UNDO LOGIC ---
+  void _performUndo() {
+    if (_undoStack.isNotEmpty) {
+      setState(() => _isUndoing = true);
+      String previousText = _undoStack.removeLast();
+      _textController.text = previousText;
+      
+      // Reset cursor to end of text
+      _textController.selection = TextSelection.collapsed(offset: previousText.length);
+      
+      Future.microtask(() => setState(() => _isUndoing = false));
+    }
   }
 
   // --- SEARCH LOGIC ---
@@ -278,6 +291,7 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
         modelPath: _modelPath,
         speed: _speechSpeed,
         speakerId: _speakerId,
+        useGpu: _useGpu,
         startIndex: startIndex,
         onChunkStart: (idx) {
           if (mounted && _playbackId == currentPlaybackId) {
@@ -404,6 +418,7 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
       final outFile = File(outputFile);
       if (await outFile.exists()) await outFile.delete();
 
+      // ALWAYS chunk the text! This gives us VAD safety, memory safety, and the ETA bar!
       List<String> chunksForExport = TextHelpers.splitIntoSentences(text);
 
       bool success = await _piperService.generateToFile(
@@ -412,8 +427,9 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
         modelPath: _modelPath,
         speed: _speechSpeed,
         speakerId: _speakerId,
+        useGpu: _useGpu,
         exportChunks: chunksForExport,
-        isSubtitlesRequested: generateSubtitles,
+        isSubtitlesRequested: generateSubtitles, // True or False, piper_service handles it
         onProgress: (current, total, eta) {
           if (mounted) {
             setState(() {
@@ -505,6 +521,7 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
             availableVoices: _piperService.availableVoices,
             speechSpeed: _speechSpeed,
             speakerId: _speakerId,
+            useGpu: _useGpu,
             onVoiceSelected: (newVoice) {
               setSheetState(() => _selectedVoice = newVoice);
               setState(() {
@@ -522,6 +539,41 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
               setSheetState(() => _speakerId = val);
               setState(() => _speakerId = val);
               _prefs.setInt('speaker_id', val);
+            },
+            onGpuChanged: (val) async {
+              if (val) {
+                // User is turning it ON. Test it first.
+                if (!File(_modelPath).existsSync()) {
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Please select a valid model first.')));
+                  return;
+                }
+                
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Testing GPU compatibility...')));
+                
+                bool gpuWorks = await _piperService.testGpuSupport(_modelPath);
+                
+                if (gpuWorks) {
+                  setSheetState(() => _useGpu = true);
+                  setState(() => _useGpu = true);
+                  _prefs.setBool('use_gpu', true);
+                  if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('GPU Acceleration Enabled!')));
+                } else {
+                  setSheetState(() => _useGpu = false);
+                  setState(() => _useGpu = false);
+                  _prefs.setBool('use_gpu', false);
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                      content: Text('Failed to enable GPU. Missing NVIDIA CUDA or ONNX Runtime libraries.'),
+                      backgroundColor: Colors.redAccent,
+                    ));
+                  }
+                }
+              } else {
+                // User is turning it OFF. Just turn it off safely.
+                setSheetState(() => _useGpu = false);
+                setState(() => _useGpu = false);
+                _prefs.setBool('use_gpu', false);
+              }
             },
             onPickCustomModel: () async {
               await _pickCustomModel();
@@ -591,41 +643,26 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
                 onPressed: isSaveDisabled ? null : _handleSaveAudio,
               ),
 
-              // --- DYNAMIC CLEAR/UNDO BUTTON ---
-              if (_textBeforeClear != null)
+              // --- DYNAMIC UNDO/CLEAR BUTTONS ---
+              if (_undoStack.isNotEmpty)
                 IconButton(
                   icon: const Icon(Icons.undo),
-                  tooltip: 'Undo Clear',
-                  onPressed: () {
-                    setState(() {
-                      _textController.text = _textBeforeClear!;
-                      _textBeforeClear = null;
-                    });
-                    _undoClearTimer?.cancel();
-                  },
-                )
-              else
-                IconButton(
-                  icon: const Icon(Icons.clear_all),
-                  tooltip: 'Clear Text',
-                  onPressed: () {
-                    if (_textController.text.isNotEmpty) {
-                      setState(() {
-                        _textBeforeClear = _textController.text;
-                        _textController.clear();
-                      });
-                      if (_isPlaying || _isGenerating) _stopPlayback();
-
-                      // Set 8-second timer to revert back to Clear button
-                      _undoClearTimer?.cancel();
-                      _undoClearTimer = Timer(const Duration(seconds: 8), () {
-                        if (mounted && _textBeforeClear != null) {
-                          setState(() => _textBeforeClear = null);
-                        }
-                      });
-                    }
-                  },
+                  tooltip: 'Undo',
+                  onPressed: _performUndo,
                 ),
+              
+              IconButton(
+                icon: const Icon(Icons.clear_all),
+                tooltip: 'Clear Text',
+                onPressed: () {
+                  if (_textController.text.isNotEmpty) {
+                    setState(() {
+                      _textController.clear();
+                    });
+                    if (_isPlaying || _isGenerating) _stopPlayback();
+                  }
+                },
+              ),
               // ---------------------------------
 
               IconButton(
@@ -673,17 +710,11 @@ class _EchoTextScreenState extends State<EchoTextScreen> {
                             border: Border.all(color: Colors.white12),
                             borderRadius: BorderRadius.circular(16),
                           ),
-                          child: Listener(
-                            onPointerDown: (event) {
-                              int now = DateTime.now().millisecondsSinceEpoch;
-                              if (now - _lastEditorTapTime < 300) {
-                                Future.delayed(const Duration(milliseconds: 100), () {
-                                  if (mounted && !_isPlaying && !_isGenerating) {
-                                    _startPlaybackFromCursor();
-                                  }
-                                });
+                          child: GestureDetector(
+                            onDoubleTap: () {
+                              if (mounted && !_isPlaying && !_isGenerating) {
+                                _startPlaybackFromCursor();
                               }
-                              _lastEditorTapTime = now;
                             },
                             child: TextField(
                               controller: _textController,

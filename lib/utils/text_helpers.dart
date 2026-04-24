@@ -1,8 +1,18 @@
 class TextHelpers {
   /// Splits a large block of text into playback chunks (sentences/paragraphs)
+  /// Uses negative lookbehinds to ignore common abbreviations (Mr., Dr., etc.)
+  /// so they don't cause unnatural audio pauses or rapid subtitle flashing.
   static List<String> splitIntoSentences(String text) {
-    final RegExp sentenceRegex = RegExp(r'.*?[.!?\n]+|.+');
+    if (text.isEmpty) return [];
+
+    final RegExp sentenceRegex = RegExp(
+      r'.*?(?<!\bMr|\bMrs|\bMs|\bDr|\bProf|\bSr|\bJr|\be\.g|\bi\.e|\bvs|\bU\.S|\bU\.S\.A|\binc|\bcorp|\bst)[.!?\n]+|.+',
+      caseSensitive: false,
+    );
+    
     final Iterable<Match> matches = sentenceRegex.allMatches(text);
+    // We do NOT trim the strings here. The HighlightingTextEditingController 
+    // needs the exact whitespace to map the highlights back to the original text length.
     return matches.map((m) => m.group(0)!).toList();
   }
 

@@ -6,9 +6,11 @@ class SettingsSheet extends StatelessWidget {
   final List<VoiceModel> availableVoices;
   final double speechSpeed;
   final int speakerId;
+  final bool useGpu;
   final Function(VoiceModel) onVoiceSelected;
   final Function(double) onSpeedChanged;
   final Function(int) onSpeakerIdChanged;
+  final Function(bool) onGpuChanged;
   final VoidCallback onPickCustomModel;
 
   const SettingsSheet({
@@ -17,9 +19,11 @@ class SettingsSheet extends StatelessWidget {
     required this.availableVoices,
     required this.speechSpeed,
     required this.speakerId,
+    required this.useGpu,
     required this.onVoiceSelected,
     required this.onSpeedChanged,
     required this.onSpeakerIdChanged,
+    required this.onGpuChanged,
     required this.onPickCustomModel,
   });
 
@@ -74,7 +78,19 @@ class SettingsSheet extends StatelessWidget {
               )
             ],
           ),
-          const Divider(height: 32, color: Colors.white12),
+          const Divider(height: 16, color: Colors.white12),
+
+          // THIS IS THE NEW SWITCH
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            activeColor: Colors.blueGrey.shade300,
+            title: const Text('Use GPU Acceleration (CUDA)', style: TextStyle(color: Colors.white70)),
+            subtitle: const Text('Requires NVIDIA GPU & ONNX GPU libraries', style: TextStyle(fontSize: 12, color: Colors.white38)),
+            value: useGpu,
+            onChanged: onGpuChanged,
+          ),
+          
+          const Divider(height: 16, color: Colors.white12),
           
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
